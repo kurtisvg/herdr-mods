@@ -5,6 +5,7 @@ Personal mods for [Herdr](https://herdr.dev). Each folder is one mod, with its o
 
 | Mod                                                | What it does                                                                                                                                                                                                                                           |
 | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| [spaces-tab-tree](spaces-tab-tree/README.md)       | Lists each space's tabs under the space and marks git worktrees in their repo's color.                                                                                                                                                                 |
 | [agents-by-tab-name](agents-by-tab-name/README.md) | Names each agent in the agents list after its tab, with its space, worktree, and remote machine underneath.                                                                                                                                            |
 
 ## Install
