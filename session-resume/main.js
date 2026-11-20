@@ -38,16 +38,26 @@ import { Lookup, machineOf } from "./lookup.js";
 const MOD = "session-resume";
 const SESSIONS = "session-resume.sessions";
 
-// Registered agent CLIs that this mod can resume.
-// Each entry defines the default executable name and `resumeArgs(id)` returning
-// CLI arguments (`resumeCommand` shell-quotes every argument).
-// For example:
-//   claude: { command: "claude", resumeArgs: (id) => ["--resume", id] }
-//   codex: { command: "codex", resumeArgs: (id) => ["resume", id] }
+// Registered agent CLIs and the arguments that resume an exact session.
 const HARNESSES = {
-  jetski: {
-    command: "jetski",
-    resumeArgs: (id) => ["--conversation", id],
+  jetski: { command: "jetski", resumeArgs: ({ id }) => ["--conversation", id] },
+  codex: { command: "codex", resumeArgs: ({ id }) => ["resume", id], homeVar: "CODEX_HOME" },
+  claude: {
+    command: "claude",
+    resumeArgs: ({ id }) => ["--resume", id],
+    homeVar: "CLAUDE_CONFIG_DIR",
+  },
+  pi: {
+    command: "pi",
+    resumeArgs: ({ id, target }) => {
+      if (!target?.startsWith("/")) return ["--session", id];
+      const directory = target.slice(0, target.lastIndexOf("/")) || "/";
+      return ["--session-dir", directory, "--session", target];
+    },
+  },
+  "fast-agent": {
+    command: "fast-agent",
+    resumeArgs: ({ id, home }) => ["go", ...(home ? ["--home", home] : []), "--resume", id],
   },
 };
 
@@ -72,8 +82,9 @@ const isInterpreterPath = (path) =>
     path,
   );
 
-const harnessOf = (entry) => entry?.harness || "jetski";
-const sessionKey = (entry) => `${harnessOf(entry)}:${entry.id}`;
+const harnessOf = (entry) => entry?.harness || entry?.provider || "jetski";
+const sessionKey = (address, entry) =>
+  JSON.stringify([machineOf(address), harnessOf(entry), entry.home ?? null, entry.id]);
 
 function selectLauncher(address, entry, harnessName) {
   const machineLaunch = LAUNCH[machineOf(address) ?? ""];
@@ -101,9 +112,18 @@ function resumeCommand(address, entry) {
     throw new Error(`Unsupported agent harness: ${harnessName}`);
   }
   const launcher = selectLauncher(address, entry, harnessName);
-  const args = harness.resumeArgs(String(entry.id)).map((arg) => quote(String(arg)));
+  if (typeof entry.id !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(entry.id)) {
+    throw new Error("Invalid session ID");
+  }
+  const args = harness.resumeArgs(entry);
+  if ([launcher, entry.cwd, entry.home, ...args].some((part) => part && /[\x00-\x1f\x7f]/.test(part))) {
+    throw new Error("Invalid character in resume command");
+  }
+  const envPrefix = harness.homeVar && entry.home
+    ? `${harness.homeVar}=${quote(entry.home)} `
+    : "";
   const cdPrefix = entry.cwd ? `cd ${quote(entry.cwd)} && ` : "";
-  return `${cdPrefix}${launcher}${args.length ? ` ${args.join(" ")}` : ""}`;
+  return `${cdPrefix}${envPrefix}${launcher} ${args.map(quote).join(" ")}`;
 }
 
 // Merge lookup results from each machine into persisted session state.
@@ -132,7 +152,8 @@ function merge(found) {
     if (!session.id) {
       // The harness is running without an active conversation on screen.
       if (old?.pid === session.pid) {
-        store[address] = { ...old, pid: 0 };
+        if (session.harness === "jetski") store[address] = { ...old, pid: 0 };
+        else delete store[address];
         changed = true;
       }
       continue;
@@ -148,7 +169,9 @@ function merge(found) {
       tab: paneOf.get(address)?.tab ?? old?.tab ?? null,
       pid: session.pid,
       shell: terminal.pid ?? old?.shell ?? null,
-      cwd: terminal.foreground?.cwd ?? terminal.cwd ?? null,
+      cwd: session.cwd ?? terminal.foreground?.cwd ?? terminal.cwd ?? null,
+      home: session.home,
+      target: session.target,
       cmd: terminal.foreground?.argv?.[0] ?? null,
     };
     if (!old || Object.keys(next).some((key) => next[key] !== old[key])) {
@@ -180,13 +203,13 @@ function merge(found) {
 export default class SessionResume extends View {
   init(_props, cx) {
     this.lookup = new Lookup(MOD);
-    this.resuming = new Map(); // address -> timestamp when its resume command was sent
+    this.resuming = new Map(); // session key -> null while queued, then send time
     if (checking()) return;
 
     cx.timer.every(1000, (cx) => {
       const now = Date.now();
-      for (const [address, startedAt] of this.resuming) {
-        if (now - startedAt > RESUME_GRACE) this.resuming.delete(address);
+      for (const [key, startedAt] of this.resuming) {
+        if (startedAt !== null && now - startedAt > RESUME_GRACE) this.resuming.delete(key);
       }
       this.lookup.tick(cx, now, merge);
     });
@@ -212,7 +235,7 @@ export default class SessionResume extends View {
     for (const terminal of allTerminals) {
       const entry = store[terminal.address];
       if (entry?.id && entry.pid && entry.pid === terminal.foreground?.pid) {
-        running.add(sessionKey(entry));
+        running.add(sessionKey(terminal.address, entry));
       }
     }
 
@@ -222,13 +245,13 @@ export default class SessionResume extends View {
       const entry = address ? store[address] : null;
       if (!entry?.id || !HARNESSES[harnessOf(entry)]) continue;
       if (!pane.program?.shell || entry.tab !== pane.tab) continue;
-      if (running.has(sessionKey(entry)) || this.resuming.has(address)) continue;
+      if (running.has(sessionKey(address, entry)) || this.resuming.has(sessionKey(address, entry))) continue;
 
       const terminal = byAddress.get(address);
       if (!terminal || terminal.state !== "live") continue;
 
       if (terminal.pid && entry.shell && terminal.pid !== entry.shell) {
-        items.push({ address, entry });
+        items.push({ address, entry, shellPid: terminal.foreground?.pid });
       }
     }
     return items;
@@ -236,28 +259,39 @@ export default class SessionResume extends View {
 
   // Send each lost conversation's resume command to its shell.
   resume(items, cx) {
-    const todo = items.filter((item) => !this.resuming.has(item.address));
+    const todo = [];
+    for (const item of items) {
+      const key = sessionKey(item.address, item.entry);
+      if (this.resuming.has(key)) continue;
+      this.resuming.set(key, null);
+      todo.push({ ...item, key });
+    }
     if (!todo.length) return;
-
-    const now = Date.now();
-    for (const item of todo) this.resuming.set(item.address, now);
     cx.notify();
 
     cx.spawn(async (cx) => {
       for (const item of todo) {
+        const terminal = terminals().find((term) => term.address === item.address);
+        if (terminal?.state !== "live" || !terminal.program?.shell ||
+            terminal.foreground?.pid !== item.shellPid) {
+          this.resuming.delete(item.key);
+          continue;
+        }
         let error = null;
         try {
           const command = resumeCommand(item.address, item.entry);
           const result = await hc(["send", item.address, command]);
           if (result.code !== 0) {
             error = (result.stderr || result.stdout || "hc send failed").trim();
+          } else {
+            this.resuming.set(item.key, Date.now());
           }
         } catch (err) {
           error = String(err);
         }
 
         if (error) {
-          this.resuming.delete(item.address);
+          this.resuming.delete(item.key);
           const label = item.entry.title || item.entry.id;
           notify({
             title: "Couldn't resume",

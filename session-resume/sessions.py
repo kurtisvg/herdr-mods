@@ -6,23 +6,27 @@
 # Input (argv[1]):
 #   {
 #     "<address>": {
-#       "pid": <int>, "program": <str|null>, "argv": <list|null>, "cwd": <str|null>
+#       "pid": <int>, "program": <str|null>, "argv": <list|null>,
+#       "cwd": <str|null>, "app": <str|null>, "title": <str|null>
 #     }
 #   }
 #   (Also accepts legacy {"<address>": <int pid>} entries.)
 # Output (stdout):
 #   {"<address>": {"harness": "<name>", "id": "<id>" | null, "title": "..."}, ...}
 #   Terminals whose foreground process matches no registered harness are omitted.
-#   `id` is null when a harness is running without an active conversation on screen.
+#   A null ID can still carry a title. Resolvers may also supply home, target, and cwd for recovery.
 #
 # Requires Python 3.9+ and uses only the standard library.
 
+import hashlib
 import json
 import os
 import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 
 UUID = rb"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 # Jetski log entries that name the active conversation. Before the first message,
@@ -230,6 +234,275 @@ def resolve_jetski(proc, db_cache):
     return {"harness": "jetski", "id": root_id, "title": title}
 
 
+def json_file(path):
+    try:
+        with path.open(encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def json_lines(path):
+    """Read recent metadata from append-only files, tolerating partial writes."""
+    try:
+        with path.open("rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            start = max(0, size - 2 * CHUNK)
+            f.seek(start)
+            if start:
+                f.readline()
+            for line in reversed(f.read(2 * CHUNK).splitlines()):
+                try:
+                    data = json.loads(line)
+                    if isinstance(data, dict):
+                        yield data
+                except ValueError:
+                    continue
+    except OSError:
+        return
+
+
+def process(pid):
+    # lstart protects records against PID reuse. LC_ALL makes the value consistent
+    # between the provider's shell and the remote lookup.
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "ppid=", "-o", "lstart=", "-o", "comm="],
+            capture_output=True, text=True, timeout=2, env={**os.environ, "LC_ALL": "C"},
+        )
+        parent, *rest = result.stdout.strip().split(maxsplit=6)
+        if len(rest) == 6:
+            return int(parent), " ".join(rest[:5]), Path(rest[5]).name
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def report_path(pid):
+    return Path.home() / ".cache" / "herdr-mods" / "sessions" / ("%d.json" % pid)
+
+
+def result(provider, cid, title="", **metadata):
+    title = " ".join(title.split())[:200] if isinstance(title, str) else ""
+    return {"harness": provider, "id": cid, "title": title, **metadata}
+
+
+def report(provider):
+    data = json.load(sys.stdin)
+    pid = os.getppid()
+    while pid > 1:
+        owner = process(pid)
+        if owner is None:
+            return
+        parent, started, name = owner
+        if provider == "pi" or name == provider:
+            break
+        pid = parent
+    else:
+        return
+
+    cid = data.get("session_id")
+    if cid is not None and not isinstance(cid, str):
+        return
+    transcript = data.get("transcript_path")
+    home = os.environ.get("CLAUDE_CONFIG_DIR") if provider == "claude" else None
+    if home:
+        home = str(Path(home).expanduser().resolve())
+    cwd = data.get("cwd")
+    record = result(provider, cid, data.get("title"), started=started,
+                    transcript=transcript, home=home,
+                    cwd=cwd if isinstance(cwd, str) and Path(cwd).is_absolute() else None)
+    target = report_path(pid)
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", dir=target.parent, delete=False) as f:
+        json.dump(record, f)
+    os.replace(f.name, target)
+
+
+def process_env(pid, key):
+    prefix = key.encode() + b"="
+    try:
+        for value in Path("/proc/%d/environ" % pid).read_bytes().split(b"\0"):
+            if value.startswith(prefix):
+                return os.fsdecode(value[len(prefix):])
+    except OSError:
+        pass
+    return ""
+
+
+def resolve_codex(proc, db_cache):
+    if proc["app"] != "codex" and Path(proc["program"] or "").name.lower() != "codex":
+        return None
+    pid, title, cwd = proc["pid"], proc["title"], proc["cwd"]
+    if not isinstance(title, str) or not isinstance(cwd, str):
+        return None
+    title = re.sub(r"^(?:[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]|\[ [!.] \] Action Required) ", "", title)
+    name, separator, project = title.rpartition(" | ")
+    if not separator or not name or not project or not Path(cwd).is_absolute():
+        return result("codex", None)
+
+    # The TUI can share an app server. Match its published name in its own
+    # working directory and reject duplicates rather than choosing by recency.
+    custom_home = process_env(pid, "CODEX_HOME")
+    home = (Path(cwd) / custom_home).resolve() if custom_home else Path.home() / ".codex"
+    databases = (p for p in home.glob("state_*.sqlite") if p.stem[6:].isdigit())
+    path = max(databases, key=lambda p: int(p.stem[6:]), default=None)
+    db = get_db(str(path), db_cache) if path else None
+    if db is None:
+        return result("codex", None, name)
+    try:
+        rows = db.execute(
+            "SELECT id FROM threads WHERE cwd = ? AND name = ? COLLATE BINARY LIMIT 2",
+            (cwd, name),
+        ).fetchall()
+    except sqlite3.Error:
+        return result("codex", None, name)
+    cid = rows[0][0] if len(rows) == 1 else None
+    return result("codex", cid, name, home=str(home), cwd=cwd)
+
+
+def resolve_pi(proc, _db_cache):
+    if proc["app"] != "pi" and Path(proc["program"] or "").name.lower() != "pi":
+        return None
+    pid, title, cwd = proc["pid"], proc["title"], proc["cwd"]
+    if not isinstance(title, str) or not isinstance(cwd, str) or not Path(cwd).is_absolute():
+        return result("pi", None)
+    project = Path(cwd).name or cwd
+    prefix, suffix = "π - ", " - " + project
+    if not title.startswith(prefix) or not title.endswith(suffix):
+        return result("pi", None)
+    name = title[len(prefix):-len(suffix)]
+    if not name:
+        return result("pi", None)
+
+    argv = proc["argv"]
+    if "--no-session" in argv:
+        return result("pi", None, name)
+    agent_dir = process_env(pid, "PI_CODING_AGENT_DIR") or str(Path.home() / ".pi/agent")
+    custom_dir = process_env(pid, "PI_CODING_AGENT_SESSION_DIR")
+    for index, arg in enumerate(argv):
+        if arg == "--session-dir" and index + 1 < len(argv):
+            custom_dir = argv[index + 1]
+        elif arg.startswith("--session-dir="):
+            custom_dir = arg.split("=", 1)[1]
+    if custom_dir:
+        directory = Path(cwd) / Path(custom_dir).expanduser()
+    else:
+        encoded_cwd = re.sub(r"[/\\:]", "-", cwd.removeprefix("/"))
+        directory = Path(cwd) / Path(agent_dir).expanduser() / "sessions" / ("--" + encoded_cwd + "--")
+
+    # Opening a file directly makes Pi use that file's parent for session
+    # switches. A title alone cannot link it to our configured directory.
+    for index, arg in enumerate(argv):
+        if arg == "--session" and index + 1 < len(argv):
+            target = argv[index + 1]
+        elif arg.startswith("--session="):
+            target = arg.split("=", 1)[1]
+        else:
+            continue
+        path = Path(cwd) / Path(target).expanduser()
+        if path.suffix != ".jsonl" or path.resolve().parent != directory.resolve():
+            return result("pi", None, name)
+
+    match = None
+    try:
+        for path in directory.glob("*.jsonl"):
+            with path.open("rb") as file:
+                header = json.loads(file.readline())
+                if not isinstance(header, dict) or header.get("type") != "session":
+                    return result("pi", None, name)
+                if header.get("cwd") != cwd:
+                    continue
+                cid = header.get("id")
+                saved_name = None
+                for line in file:
+                    if b'"session_info"' in line:
+                        try:
+                            entry = json.loads(line)
+                        except ValueError:
+                            return result("pi", None, name)
+                        if not isinstance(entry, dict):
+                            return result("pi", None, name)
+                        if entry.get("type") == "session_info":
+                            saved_name = entry.get("name")
+            if not isinstance(cid, str) or saved_name != name:
+                continue
+            if match is not None:
+                return result("pi", None, name)
+            match = result("pi", cid, name, target=str(path), cwd=cwd)
+    except (OSError, ValueError):
+        # An unreadable file could contain a duplicate name.
+        return result("pi", None, name)
+    return match or result("pi", None, name)
+
+
+def claude_title(transcript, cid):
+    if not isinstance(transcript, str) or not Path(transcript).is_absolute():
+        return ""
+    generated = ""
+    for row in json_lines(Path(transcript)):
+        if row.get("sessionId") not in (None, cid):
+            continue
+        if row.get("type") == "custom-title" and row.get("customTitle"):
+            return row["customTitle"]
+        if not generated and row.get("type") == "ai-title":
+            generated = row.get("aiTitle") or ""
+    return generated
+
+
+def resolve_report(proc, _db_cache):
+    pid = proc["pid"]
+    data = json_file(report_path(pid))
+    if not data:
+        return None
+    owner = process(pid)
+    if owner is None or owner[1] != data.get("started"):
+        return None
+
+    provider, cid = data.get("harness", data.get("provider")), data.get("id")
+    home, transcript, cwd = data.get("home"), data.get("transcript"), data.get("cwd")
+    if provider == "claude" and cid:
+        return result(provider, cid, claude_title(transcript, cid), home=home, cwd=cwd)
+    if provider == "pi" and cid:
+        # Pi creates the file lazily. An ephemeral or unsaved session cannot be resumed.
+        if isinstance(transcript, str) and Path(transcript).is_file():
+            return result(provider, cid, data.get("title"), target=transcript, cwd=cwd)
+    if provider in ("claude", "pi"):
+        return result(provider, None)
+    return None
+
+
+def fast_agent(path, pid):
+    lock = Path(path)
+    match = re.fullmatch(r"([A-Za-z0-9_-]+)-([0-9a-f]{12})\.owner\.lock", lock.name)
+    if lock.parent.name != ".locks" or match is None:
+        return None
+    cid, digest = match.groups()
+    if hashlib.sha256(cid.encode()).hexdigest()[:12] != digest:
+        return None
+    owner = json_file(lock.with_suffix(".json"))
+    if owner.get("pid") != pid:
+        return None
+    sessions = lock.parent.parent
+    data = json_file(sessions / cid / "session.json")
+    if not data:
+        return None
+    metadata = data.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    title = metadata.get("title") or metadata.get("label") or metadata.get("last_user_prompt")
+    return result("fast-agent", cid, title, home=str(sessions.parent))
+
+
+def resolve_fast_agent(proc, _db_cache):
+    sessions = [
+        session for path in proc["written"] if path.endswith(".owner.lock")
+        if (session := fast_agent(path, proc["pid"])) is not None
+    ]
+    return sessions[0] if len(sessions) == 1 else None
+
+
 # Ordered list of harness resolvers. Each resolver receives `proc` and `db_cache`
 # (for `get_db()`). `proc` holds `pid`, `program`, `argv`, `cwd`, the paths of its
 # open `files`, and the subset `written` that it opened for writing. A resolver
@@ -238,8 +511,11 @@ def resolve_jetski(proc, db_cache):
 #
 # The callers send every foreground program that is not a shell, so a resolver must
 # return `None` unless it is sure that the process is its agent CLI.
-# Add resolvers here for other CLIs (Claude Code, Codex, Pi, or fast-agent).
 HARNESSES = [
+    resolve_report,
+    resolve_codex,
+    resolve_pi,
+    resolve_fast_agent,
     resolve_jetski,
 ]
 
@@ -273,6 +549,8 @@ def normalize_request(raw):
                 "program": program if isinstance(program, str) else None,
                 "argv": argv,
                 "cwd": cwd if isinstance(cwd, str) else None,
+                "app": info.get("app"),
+                "title": info.get("title"),
             }
             continue
 
@@ -283,6 +561,8 @@ def normalize_request(raw):
                 "program": None,
                 "argv": [],
                 "cwd": None,
+                "app": None,
+                "title": None,
             }
 
     return processes
@@ -318,4 +598,8 @@ def main():
     sys.stdout.write(json.dumps(results))
 
 
-main()
+if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--report" and sys.argv[2] in ("claude", "pi"):
+        report(sys.argv[2])
+    else:
+        main()

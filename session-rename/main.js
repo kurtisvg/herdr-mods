@@ -48,12 +48,15 @@ const titleWhileWorking = (report) => (report.state === "working" ? report.msg :
 //   - read: a reader that returns the title, or nothing when the report carries
 //     no title. It must return the same text as the resolver in `sessions.py`.
 //
-// To add Claude Code, Codex, Pi, or fast-agent, first read `terminals()[i].report`
+// To add another status-report reader, first read `terminals()[i].report`
 // while the CLI runs. Check its `app` value, which field holds the conversation
 // title, and in which states. Then add an entry here. Use `titleWhileWorking`
 // when it fits. Otherwise write a reader.
 const REPORT_TITLE = new Map([
   ["jetski", { harness: "jetski", read: titleWhileWorking }],
+  ["pi", { harness: "pi", read: (report) =>
+    ["working", "done"].includes(report.state) ? report.msg : null }],
+  ["fast-agent", { harness: "fast-agent", read: (report) => report.title }],
 ]);
 
 // Returns the harness and the title that a terminal's status report carries now.
@@ -97,7 +100,7 @@ function update(found) {
     if (old?.pid === pid && old.reported === titled.title) continue;
 
     const sameTitle =
-      old?.title === titled.title && (old.harness ?? "jetski") === titled.harness;
+      old?.title === titled.title && (old.harness ?? old.provider ?? "jetski") === titled.harness;
     store[address] = {
       harness: titled.harness,
       // A new title can belong to another conversation, so the ID is unknown.
@@ -118,7 +121,7 @@ function update(found) {
 
     const old = store[address];
     const titled = reported(term);
-    if (!session.id) {
+    if (!session.id && !session.title) {
       // The agent CLI is running without an active conversation on screen.
       if (old?.pid === session.pid && !titled) {
         store[address] = { ...old, pid: 0 };
@@ -132,8 +135,10 @@ function update(found) {
     // finds for the same process completes it.
     const sameConversation =
       old != null &&
-      (old.harness ?? "jetski") === harness &&
-      (old.id === session.id || (old.id == null && old.pid === session.pid));
+      (old.harness ?? old.provider ?? "jetski") === harness &&
+      (session.id
+        ? old.id === session.id || (old.id == null && old.pid === session.pid)
+        : old.pid === session.pid && old.title === session.title);
     let title = sameConversation ? old.title : "";
     let resolved = sameConversation ? old.resolved ?? null : null;
 

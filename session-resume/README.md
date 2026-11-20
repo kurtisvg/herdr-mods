@@ -1,12 +1,19 @@
 # session-resume
 
-Enables resume sessions when the machine running `herdr-hc` restarts. Provides a "Resume" button when resumable sessions are found. Remembers missing terminals for 7 days and skips conversations already running in another terminal.
+Enables resume sessions when the machine running `herdr-hc` restarts. Provides a
+"Resume" button when resumable sessions are found. Remembers missing terminals for 7
+days and skips conversations already running in another terminal.
 
-**Supported harnesses:** Jetski
+**Supported harnesses:** Jetski, Codex, Claude Code, Pi, and fast-agent
+
+Codex, Pi, and fast-agent work without setup. See the
+[session reporting guide](../integrations/README.md) for Claude Code setup and the
+requirements for matching saved sessions.
 
 ## Install
 
-1. Make sure each tracked machine has `python3` (3.9+) (`lsof` is used on macOS where it is built in, and is not needed on Linux):
+1. Make sure each tracked machine has `python3` (3.9+) (`lsof` is used on macOS where it
+   is built in, and is not needed on Linux):
 
    ```sh
    python3 --version    # 3.9 or later
@@ -20,13 +27,15 @@ Enables resume sessions when the machine running `herdr-hc` restarts. Provides a
 
    Keep this repo in place because Herdr's mods folder stores a symlink to it.
 
-3. Add the mod as a floating block in your custom layout (it stays hidden until there is something to resume). If you don't have a custom layout yet, clone `main`:
+3. Add the mod as a floating block in your custom layout (it stays hidden until there is
+   something to resume). If you don't have a custom layout yet, clone `main`:
 
    ```sh
    herdr-app do layout.clone '{"name":"main","as":"my-layout"}'
    ```
 
-   In `~/.config/herdr-app/layouts/my-layout.json`, add this to a node's `floating` list (for example `"id": "sidebar-lists"`):
+   In `~/.config/herdr-app/layouts/my-layout.json`, add this to a node's `floating` list
+   (for example `"id": "sidebar-lists"`):
 
    ```json
    "floating": [
@@ -40,7 +49,8 @@ Enables resume sessions when the machine running `herdr-hc` restarts. Provides a
    herdr-app check ~/.config/herdr-app/mods/session-resume    # prints "check passed"
    ```
 
-5. Optional — bind a key in `~/.config/herdr-app/keys.json` to trigger resume without clicking:
+5. Optional — bind a key in `~/.config/herdr-app/keys.json` to trigger resume without
+   clicking:
 
    ```json
    { "global": { "<key>": "session-resume.resume_all" } }
@@ -48,4 +58,5 @@ Enables resume sessions when the machine running `herdr-hc` restarts. Provides a
 
 ## Notes
 
-- Herdr does not watch files behind symlinks. Run `./plugin.sh reload session-resume` after editing files or pulling updates.
+- Herdr does not watch files behind symlinks. Run `./plugin.sh reload session-resume`
+  after editing files or pulling updates.
