@@ -3,6 +3,10 @@
 Personal mods for [Herdr](https://herdr.dev). Each folder is one mod, with its own
 `README.md` covering what it does and how to wire it into a layout.
 
+| Mod                                                | What it does                                                                                                                                                                                                                                           |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| [agents-by-tab-name](agents-by-tab-name/README.md) | Names each agent in the agents list after its tab, with its space, worktree, and remote machine underneath.                                                                                                                                            |
+
 ## Install
 
 1. Start Herdr once. From this folder, link the mods into `~/.config/herdr-app/mods`:
