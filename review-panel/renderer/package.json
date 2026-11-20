@@ -1,0 +1,10 @@
+{
+  "name": "review-panel-renderer",
+  "private": true,
+  "type": "module",
+  "description": "Renders mermaid diagrams to PNG for the review-panel Herdr mod, using the Chrome already on this machine.",
+  "dependencies": {
+    "mermaid": "^11",
+    "puppeteer-core": "^24"
+  }
+}

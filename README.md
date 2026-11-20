@@ -7,6 +7,7 @@ Personal mods for [Herdr](https://herdr.dev). Each folder is one mod, with its o
 | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | [spaces-tab-tree](spaces-tab-tree/README.md)       | Lists each space's tabs under the space and marks git worktrees in their repo's color.                                                                                                                                                                 |
 | [agents-by-tab-name](agents-by-tab-name/README.md) | Names each agent in the agents list after its tab, with its space, worktree, and remote machine underneath.                                                                                                                                            |
+| [review-panel](review-panel/README.md)             | Puts Files, Changes, and Comments in one side panel, where you can edit files, comment on lines or rendered markdown, and send the review to an agent. Also provides an optional tab bar with top-right mode buttons and a standalone markdown viewer. |
 
 ## Install
 
