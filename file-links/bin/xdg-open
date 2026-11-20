@@ -1,0 +1,58 @@
+#!/bin/sh
+# Herdr-scoped `xdg-open` wrapper. Add `file-links/bin` to `PATH` ONLY inside
+# Herdr's launcher (never globally). Local file links opened by `herdr-app`
+# are routed to Herdr's Files panel; everything else falls through to the real
+# system `xdg-open`.
+
+SELF_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+REAL_SELF_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+MOD_DIR="$(dirname -- "$REAL_SELF_DIR")"
+
+# Strip this wrapper directory from PATH before delegating so we never recurse.
+CLEAN_PATH=""
+OLD_IFS="$IFS"
+IFS=":"
+for dir in $PATH; do
+  [ -z "$dir" ] && continue
+  if [ "$dir" = "$SELF_DIR" ] || [ "$dir" = "$REAL_SELF_DIR" ]; then
+    continue
+  fi
+  if [ -n "$CLEAN_PATH" ]; then
+    CLEAN_PATH="$CLEAN_PATH:$dir"
+  else
+    CLEAN_PATH="$dir"
+  fi
+done
+IFS="$OLD_IFS"
+
+run_real() {
+  PATH="$CLEAN_PATH"
+  export PATH
+  REAL_BIN="$(command -v xdg-open 2>/dev/null || true)"
+  if [ -n "$REAL_BIN" ]; then
+    exec "$REAL_BIN" "$@"
+  fi
+  exec /usr/bin/xdg-open "$@"
+}
+
+# Fast-path pass-through for flags, multi-arg calls, and non-file URLs.
+if [ "$#" -ne 1 ]; then
+  run_real "$@"
+fi
+
+case "$1" in
+  "" | -* | http://* | https://* | mailto:* | ftp://* | ssh://* | git://* | tel://* | magnet:*)
+    run_real "$@"
+    ;;
+esac
+
+APP_HOME="${HERDR_APP_HOME:-$HOME/.config/herdr-app}"
+if [ ! -S "$APP_HOME/herdr-app.sock" ]; then
+  run_real "$@"
+fi
+
+if PATH="$CLEAN_PATH" python3 "$MOD_DIR/open-file.py" "$1"; then
+  exit 0
+fi
+
+run_real "$@"

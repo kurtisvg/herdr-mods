@@ -34,6 +34,7 @@ import {
   layout,
   exec,
   hc,
+  home,
   readTextFile,
   writeTextFile,
   watchFolder,
@@ -77,11 +78,19 @@ import {
   pictureFile,
   tokenizeLine,
   formatMarkdown,
+  isAbsolutePath,
+  diskPath,
+  displayPath,
+  toPanelPath,
+  lineToOffset,
+  parseLocalLink,
 } from "./model.js";
 import { Diagrams } from "./diagrams.js";
 import { Pictures, CACHE as PICTURES } from "./pictures.js";
 
 const MODES = ["files", "changes", "comments"];
+const FILE_LINKS_OPEN = "file-links.open";
+const FILE_LINKS_FRESH_MS = 5000;
 const PAGE = 300; // rows per page in Comment and diff views
 const SPAN_BUDGET = 1100; // max colored token divs once cached
 const FIRST_BUDGET = 700; // max colored token divs while tokenizing
@@ -358,6 +367,18 @@ export class Panel {
     this.copiedTimer = null;
     this.commenting = false;
     this.revealRow = null;
+    this.pendingLine = null;
+    const initialLink = shared(FILE_LINKS_OPEN);
+    const linkAge =
+      typeof initialLink?.at === "number" ? Date.now() - initialLink.at : Infinity;
+    const freshLink =
+      Boolean(initialLink?.id && initialLink?.path) &&
+      linkAge >= -FILE_LINKS_FRESH_MS &&
+      linkAge <= FILE_LINKS_FRESH_MS;
+    this.seenFileLink = initialLink?.id ?? null;
+    this.pendingFileLink = freshLink ? initialLink : null;
+    this.fileLinkTimer = null;
+    this.placedKey = null;
     this.watched = null; // token of the watch loop that is current
     this.folderWatch = null; // the `watchFolder` call in flight, to cancel it
     this.diagrams = new Diagrams();
@@ -413,6 +434,8 @@ export class Panel {
     this.saveTimer?.cancel();
     this.savedTimer?.cancel();
     this.copiedTimer?.cancel();
+    this.fileLinkTimer?.cancel();
+    this.fileLinkTimer = null;
     const pendingWrite = this.flushPendingWrite();
     this.editor?.release();
     this.editor = null;
@@ -635,6 +658,7 @@ export class Panel {
         const repo = top?.code === 0;
         const root = repo ? top.stdout.trim() : (cwd ?? null);
         this.place(root, on, repo, tab);
+        this.placedKey = context.key;
         this.tend();
         if (!root) return;
         if (repo) await this.loadChanges(context);
@@ -883,14 +907,14 @@ export class Panel {
     if (
       !this.canEdit ||
       !this.editor ||
-      !this.editorRoot ||
       !this.editorPath ||
+      (!this.editorRoot && !isAbsolutePath(this.editorPath)) ||
       this.conflictDisk !== null ||
       checking()
     ) {
       return null;
     }
-    const fullPath = `${this.editorRoot}/${this.editorPath}`;
+    const fullPath = diskPath(this.editorRoot, this.editorPath);
     const text = this.editor.value();
     const inflight =
       this.saveTask &&
@@ -930,8 +954,8 @@ export class Panel {
     if (
       !this.editor ||
       !this.canEdit ||
-      !this.editorRoot ||
       !this.editorPath ||
+      (!this.editorRoot && !isAbsolutePath(this.editorPath)) ||
       checking()
     ) {
       return;
@@ -950,8 +974,8 @@ export class Panel {
     if (
       !this.editor ||
       !this.canEdit ||
-      !this.editorRoot ||
       !this.editorPath ||
+      (!this.editorRoot && !isAbsolutePath(this.editorPath)) ||
       checking()
     ) {
       return;
@@ -964,7 +988,7 @@ export class Panel {
     const text = this.editor.value();
     const root = this.editorRoot;
     const path = this.editorPath;
-    const fullPath = `${root}/${path}`;
+    const fullPath = diskPath(root, path);
     if (!force && text === this.diskText) {
       this.dirty = false;
       return;
@@ -1045,7 +1069,10 @@ export class Panel {
     this.dirty = false;
     this.saveError = null;
     this.editor.set_value(text);
-    if (this.open?.path === this.editorPath && this.editorRoot) {
+    if (
+      this.open?.path === this.editorPath &&
+      (this.editorRoot || isAbsolutePath(this.editorPath))
+    ) {
       this.applyLocalText(this.editorRoot, this.editorPath, text, cx);
     }
     cx.notify();
@@ -1065,7 +1092,7 @@ export class Panel {
   applyLocalText(root, path, text, cx) {
     this.rows = fileRows(text);
     if (isMarkdown(path) && this.mdMode === "rendered") {
-      const dir = `${root}/${path}`.replace(/\/[^/]*$/, "");
+      const dir = diskPath(root, path).replace(/\/[^/]*$/, "");
       this.blocks = markdownBlocks(text, (src) => pictureFile(src, dir));
       const blocks = this.blocks;
       cx.spawn(async (cx) => {
@@ -1184,6 +1211,7 @@ export class Panel {
     this.jump = null;
     this.reveal = null;
     this.revealRow = null;
+    this.pendingLine = null;
     this.blocks = null;
     this.anchorBlock = null;
     this.headBlock = null;
@@ -1191,7 +1219,7 @@ export class Panel {
     this.mdMode = "rendered";
   }
 
-  show(path, view, cx, comment) {
+  show(path, view, cx, comment, opts = {}) {
     this.shut();
     const target = view === "changes" ? "changes" : "files";
     if (this.mode !== target) {
@@ -1200,13 +1228,25 @@ export class Panel {
       localStorage.setItem("mode", target);
       setShared("review-panel.mode", target);
     }
-    this.open = { path, view: target };
+    this.open = { path, view: target, local: Boolean(opts.local) };
+    this.pendingLine = opts.line ? { line: opts.line, col: opts.col ?? 1 } : null;
     this.commenting =
-      Boolean(comment) || this.comments().some((c) => c.path === path);
-    this.mdMode = "rendered";
+      Boolean(comment) ||
+      (!opts.line && this.comments().some((c) => c.path === path));
+    this.mdMode = opts.line && isMarkdown(path) ? "edit" : "rendered";
     this.jump = comment ?? "top";
     this.fetch(cx);
     cx.notify();
+  }
+
+  openFromLink(request, cx) {
+    const target = toPanelPath(request, this.root);
+    if (!target) return;
+    this.show(target, "files", cx, null, {
+      line: request.line,
+      col: request.col,
+      local: true,
+    });
   }
 
   async illustrate(blocks, cx) {
@@ -1335,10 +1375,11 @@ export class Panel {
     } else {
       this.cancel();
       this.rows = fileRows(liveText);
-      const dir = `${this.root}/${this.open.path}`.replace(/\/[^/]*$/, "");
+      const dir = diskPath(this.root, this.open.path).replace(/\/[^/]*$/, "");
+      const readOn = this.open.local ? null : this.on;
       this.blocks = markdownBlocks(
         liveText,
-        this.on ? null : (src) => pictureFile(src, dir),
+        readOn ? null : (src) => pictureFile(src, dir),
       );
       const blocks = this.blocks;
       cx.spawn(async (cx) => {
@@ -1362,7 +1403,7 @@ export class Panel {
     const root = this.root;
     const on = context.on;
     const seq = this.loadSeq;
-    if (!open || !root) return;
+    if (!open || (!root && !isAbsolutePath(open.path))) return;
     const change =
       open.view === "changes"
         ? this.files.find((f) => f.path === open.path)
@@ -1395,9 +1436,10 @@ export class Panel {
       }
     } else {
       const readSaveSeq = this.saveSeq;
-      const text = await readTextFile(`${root}/${open.path}`, { on }).catch(
-        () => null,
-      );
+      const fullPath = diskPath(root, open.path);
+      const readOn = open.local ? null : on;
+      const edRoot = root ?? "";
+      const text = await readTextFile(fullPath, { on: readOn }).catch(() => null);
       if (text === null) {
         notice =
           "Cannot show this file (missing, binary, larger than 1 MiB, or unreadable)";
@@ -1412,15 +1454,26 @@ export class Panel {
           // A save that ended during the read matters only when the editor
           // already shows this file. A file that has no editor yet needs one.
           (this.saveSeq === readSaveSeq ||
-            this.editorRoot !== root ||
+            this.editorRoot !== edRoot ||
             this.editorPath !== open.path)
         ) {
-          this.syncEditor(root, open.path, text, !on);
+          this.syncEditor(edRoot, open.path, text, !readOn);
+        }
+        if (
+          this.pendingLine &&
+          this.editor &&
+          this.open === open &&
+          this.loadSeq === seq
+        ) {
+          const { line, col } = this.pendingLine;
+          this.pendingLine = null;
+          const offset = lineToOffset(this.editor.value(), line, col);
+          this.editor.set_selected_range({ start: offset, end: offset });
         }
         const live =
           open.view === "files" &&
           (this.dirty || this.saving || this.saveSeq !== readSaveSeq) &&
-          this.editorRoot === root &&
+          this.editorRoot === edRoot &&
           this.editorPath === open.path &&
           this.editor
             ? this.editor.value()
@@ -1430,10 +1483,10 @@ export class Panel {
           isMarkdown(open.path) &&
           (open.view === "changes" ? !this.raw : this.mdMode === "rendered");
         if (drawnNow) {
-          const dir = `${root}/${open.path}`.replace(/\/[^/]*$/, "");
+          const dir = fullPath.replace(/\/[^/]*$/, "");
           blocks = markdownBlocks(
             live,
-            on ? null : (src) => pictureFile(src, dir),
+            readOn ? null : (src) => pictureFile(src, dir),
           );
         } else if (change) {
           for (const row of rows) row.kind = "+";
@@ -2201,26 +2254,16 @@ export class Panel {
     }
     // A malformed web or mail address is not a file.
     if (/^(?:https?|mailto):/i.test(url)) return;
-    const clean = url.split("#")[0];
-    if (!isMarkdown(clean) || !this.open || !this.root) return;
-    let path = decodeURIComponent(
-      clean.startsWith("file://") ? clean.slice(7) : clean,
-    );
-    if (!path.startsWith("/")) {
-      const folder = this.open.path.includes("/")
-        ? this.open.path.replace(/\/[^/]*$/, "/")
-        : "";
-      path = `${this.root}/${folder}${path}`;
-    }
-    const parts = [];
-    for (const part of path.split("/")) {
-      if (part === "..") parts.pop();
-      else if (part && part !== ".") parts.push(part);
-    }
-    path = "/" + parts.join("/");
-    if (path.startsWith(this.root + "/")) {
-      this.show(path.slice(this.root.length + 1), "files", cx);
-    }
+    if (!this.open) return;
+    const parsed = parseLocalLink(url, diskPath(this.root, this.open.path));
+    if (!parsed) return;
+    const target = toPanelPath({ path: parsed.path }, this.root);
+    if (!target) return;
+    this.show(target, "files", cx, null, {
+      line: parsed.line,
+      col: parsed.col,
+      local: this.open.local,
+    });
   }
 
   drawn(t, comments, boxWidth) {
@@ -2605,6 +2648,12 @@ export class Panel {
       }
     }
 
+    const linkReq = shared(FILE_LINKS_OPEN);
+    if (linkReq?.id && linkReq.id !== this.seenFileLink && linkReq.path) {
+      this.seenFileLink = linkReq.id;
+      this.pendingFileLink = linkReq;
+    }
+
     const tabsNow = this.tabs();
     const names = tabNames(tabsNow);
     const needFiles =
@@ -2618,6 +2667,24 @@ export class Panel {
       (this.key() !== this.context?.key || names !== this.names || needFiles || stale)
     ) {
       this.refresh(cx);
+    }
+
+    // Wait for place() to settle for the active context before opening a linked
+    // file so place() does not shut() it on first mount or space switch. Defer
+    // outside render() because show() releases any live EditorState and notifies.
+    if (
+      shown() !== false &&
+      this.pendingFileLink &&
+      !this.fileLinkTimer &&
+      (this.placedKey === this.context?.key || !this.loading)
+    ) {
+      this.fileLinkTimer = cx.timer.after(0, (cx) => {
+        this.fileLinkTimer = null;
+        const req = this.pendingFileLink;
+        if (!req || shown() === false) return;
+        this.pendingFileLink = null;
+        this.openFromLink(req, cx);
+      });
     }
 
     const t = theme();
@@ -2738,7 +2805,7 @@ export class Panel {
       !this.on &&
       this.canEdit &&
       Boolean(this.editor);
-    const editLabel = this.on ? "Read" : "Edit";
+    const editLabel = this.on && !this.open?.local ? "Read" : "Edit";
     const fileCount = this.open ? (counts.get(this.open.path) ?? 0) : 0;
     const commentLabel = fileCount ? `Comment ${fileCount}` : "Comment";
     const saveState =
@@ -2762,7 +2829,7 @@ export class Panel {
           : "Comments"
       : "Review";
     const subtitle = this.open
-      ? this.open.path
+      ? displayPath(this.open.path, home())
       : this.mode === "files"
         ? (this.root?.split(/[\\/]/).pop() ?? "")
         : this.mode === "comments"

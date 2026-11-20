@@ -38,6 +38,11 @@ import {
   tokenizeLine,
   wrapMarkdown,
   formatMarkdown,
+  diskPath,
+  displayPath,
+  toPanelPath,
+  lineToOffset,
+  parseLocalLink,
 } from "../model.js";
 
 const DIFF = [
@@ -1326,4 +1331,29 @@ test("formatMarkdown handles borderless tables, quoted tables, code fences, and 
   ].join("\n");
 
   assert.equal(formatMarkdown(input, 88), expected);
+});
+
+test("file-link helpers resolve relative, external, and markdown links with line targets", () => {
+  assert.equal(diskPath("/repo", "src/a.js"), "/repo/src/a.js");
+  assert.equal(diskPath("/repo", "/tmp/a.js"), "/tmp/a.js");
+  assert.equal(displayPath("/home/u/notes.md", "/home/u"), "~/notes.md");
+  assert.equal(
+    toPanelPath(
+      { path: "/link/a.js", realpath: "/repo/src/a.js" },
+      "/repo",
+    ),
+    "src/a.js",
+  );
+  assert.equal(lineToOffset("one\ntwo\nthree", 2, 3), 6);
+
+  assert.deepEqual(
+    parseLocalLink("../src/app.ts:42:7", "/repo/docs/guide.md"),
+    { path: "/repo/src/app.ts", line: 42, col: 7 },
+  );
+  assert.deepEqual(
+    parseLocalLink("file:///tmp/my%20file.rs#L10C2", "/repo/docs/guide.md"),
+    { path: "/tmp/my file.rs", line: 10, col: 2 },
+  );
+  assert.equal(parseLocalLink("#heading-anchor", "/repo/docs/guide.md"), null);
+  assert.equal(parseLocalLink("https://example.com", "/repo/docs/guide.md"), null);
 });

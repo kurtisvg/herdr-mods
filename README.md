@@ -10,6 +10,7 @@ Personal mods for [Herdr](https://herdr.dev). Each folder is one mod, with its o
 | [session-rename](session-rename/README.md)         | Names each tab after the agent conversation running in it, reading status reports first and falling back to `sessions.py`.                                                                                                                             |
 | [session-resume](session-resume/README.md)         | Shows a one-click Resume button to bring back agent conversations after a restart replaces their terminals with fresh shells.                                                                                                                          |
 | [review-panel](review-panel/README.md)             | Puts Files, Changes, and Comments in one side panel, where you can edit files, comment on lines or rendered markdown, and send the review to an agent. Also provides an optional tab bar with top-right mode buttons and a standalone markdown viewer. |
+| [file-links](file-links/README.md)                 | Opens Ctrl+clicked local file links from Herdr terminals in the right-hand Files panel (works with `review-panel` or its own drop-in `files` panel) while leaving web URLs to the system opener.                                                       |
 
 ## Install
 
