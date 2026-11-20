@@ -2,13 +2,17 @@
 
 Automatically names each Herdr tab after the agent conversation running in it. Reads the terminal status report (OSC 7501) first for ~1-second updates and falls back to `sessions.py` when the report has no title. Manual tab renames stay until the conversation's title changes, and sub-agent terminals take their parent conversation's title.
 
-**Supported harnesses:** Jetski.
+**Supported harnesses:** Jetski, Codex, Claude Code, Pi, and fast-agent
+
+Codex, Pi, and fast-agent work without setup. See the
+[session reporting guide](#claude-code-setup) for Claude Code setup
+and the requirements for matching saved sessions.
 
 ![A tab named after the conversation running in it](images/tab-name.png)
 
 ## Install
 
-1. Make sure each tracked machine has Jetski and `python3` (3.9+) for the fallback lookup, plus the Herdr desktop app (tested with 0.1.16) locally (`lsof` is used on macOS where it is built in, and is not needed on Linux):
+1. Make sure each tracked machine has its agent CLI and `python3` (3.9+) for the fallback lookup, plus the Herdr desktop app (tested with 0.1.16) locally (`lsof` is used on macOS where it is built in, and is not needed on Linux):
 
    ```sh
    python3 --version    # 3.9 or later
@@ -45,5 +49,33 @@ Automatically names each Herdr tab after the agent conversation running in it. R
 ## Notes
 
 - Jetski's status report currently includes the title only for resumed conversations with a saved title or after `/rename`; new auto-titled conversations rely on `sessions.py` (machines without `python3` only get reported titles).
-- To add another agent CLI (such as Claude Code, Codex, Pi, or `fast-agent`), add a resolver to `HARNESSES` in `sessions.py` and optionally a status-report reader to `REPORT_TITLE` in `main.js`.
+- To add another agent CLI, add a resolver to `HARNESSES` in `sessions.py` and optionally a status-report reader to `REPORT_TITLE` in `main.js`.
 - Herdr does not watch files behind symlinks. Run `./plugin.sh reload session-rename` after editing files or pulling updates.
+
+## Claude Code setup
+
+Configure the hook on each machine that runs Claude Code. The command can
+point to either mod’s installed `sessions.py`.
+
+Add this entry to the `hooks` object's `SessionStart` array. Merge it into
+existing hooks in `~/.claude/settings.json`.
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 '/absolute/path/to/session-rename/sessions.py' --report claude"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Claude Code titles come from title entries in the session transcript.
+A title can appear after the session ID is available for recovery.

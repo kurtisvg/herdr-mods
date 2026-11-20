@@ -5,7 +5,12 @@
 // works standalone. When you install both mods, each mod runs its own lookup.
 // Keep both copies in sync when editing this file.
 
-import { terminals, exec, readTextFile, appHome, window } from "herdr";
+import { panes, terminals, exec, readTextFile, appHome, window } from "herdr";
+
+const stableTitle = (title) => title?.replace(
+  /^(?:[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]|\[ [!.] \] Action Required) /u,
+  "",
+) ?? null;
 
 const ACTIVE_EVERY = 15000; // polling interval while the Herdr window is active
 const IDLE_EVERY = 60000; // polling interval while the Herdr window is inactive
@@ -79,6 +84,7 @@ export class Lookup {
     if (!this.script) return null;
 
     const byMachine = new Map(); // machine -> { address: { pid, program, argv, cwd } }
+    const paneTitles = new Map(panes().map((pane) => [pane.terminal, pane.title]));
     for (const terminal of terminals()) {
       const foregroundPid = terminal.foreground?.pid;
       if (!tracked(terminal) || !foregroundPid) continue;
@@ -86,7 +92,9 @@ export class Lookup {
       if (!byMachine.has(machine)) byMachine.set(machine, {});
       byMachine.get(machine)[terminal.address] = {
         pid: foregroundPid,
-        program: terminal.program?.name ?? terminal.program?.command ?? null,
+        program: terminal.foreground?.name ?? terminal.program?.name ?? null,
+        app: terminal.report?.app ?? null,
+        title: terminal.title || paneTitles.get(terminal.address) || null,
         argv: terminal.foreground?.argv ?? null,
         cwd: terminal.foreground?.cwd ?? terminal.cwd ?? null,
       };
@@ -114,6 +122,10 @@ export class Lookup {
               id: session.id ?? null,
               title: session.title ?? "",
               pid,
+              terminalTitle: processes[address].title,
+              home: session.home ?? null,
+              target: session.target ?? null,
+              cwd: session.cwd ?? null,
             };
           }
         } catch (_err) {
@@ -121,6 +133,16 @@ export class Lookup {
         }
       }),
     );
+    const currentTitles = new Map(panes().map((pane) => [pane.terminal, pane.title]));
+    for (const terminal of terminals()) {
+      const session = found[terminal.address];
+      if (!session || (session.harness !== "codex" && session.harness !== "pi")) continue;
+      const title = terminal.title || currentTitles.get(terminal.address) || null;
+      if (stableTitle(title) !== stableTitle(session.terminalTitle)) {
+        delete found[terminal.address];
+        this.lookSoon(1200);
+      }
+    }
     return found;
   }
 }
