@@ -1,0 +1,7 @@
+# written by the Herdr app into every mod folder.
+gpui-kit.d.ts
+jsconfig.json
+
+# installed packages (restore with npm install) and system files.
+node_modules/
+.DS_Store
