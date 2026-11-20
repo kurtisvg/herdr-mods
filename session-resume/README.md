@@ -7,7 +7,7 @@ days and skips conversations already running in another terminal.
 **Supported harnesses:** Jetski, Codex, Claude Code, Pi, and fast-agent
 
 Codex, Pi, and fast-agent work without setup. See the
-[session reporting guide](../integrations/README.md) for Claude Code setup and the
+[session reporting guide](../session-rename/README.md#claude-code-setup) for Claude Code setup and the
 requirements for matching saved sessions.
 
 ## Install
@@ -60,3 +60,11 @@ requirements for matching saved sessions.
 
 - Herdr does not watch files behind symlinks. Run `./plugin.sh reload session-resume`
   after editing files or pulling updates.
+
+## Session matching
+
+- Codex recovery requires a unique saved thread with the terminal title’s thread
+  name in the working directory.
+- Pi recovery requires a unique saved session with that name in the configured
+  session directory for the working directory. Duplicate names and ephemeral
+  sessions can still name the tab.

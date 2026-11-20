@@ -288,7 +288,7 @@ def result(provider, cid, title="", **metadata):
     return {"harness": provider, "id": cid, "title": title, **metadata}
 
 
-def report(provider):
+def report_claude():
     data = json.load(sys.stdin)
     pid = os.getppid()
     while pid > 1:
@@ -296,7 +296,7 @@ def report(provider):
         if owner is None:
             return
         parent, started, name = owner
-        if provider == "pi" or name == provider:
+        if name == "claude":
             break
         pid = parent
     else:
@@ -306,11 +306,11 @@ def report(provider):
     if cid is not None and not isinstance(cid, str):
         return
     transcript = data.get("transcript_path")
-    home = os.environ.get("CLAUDE_CONFIG_DIR") if provider == "claude" else None
+    home = os.environ.get("CLAUDE_CONFIG_DIR")
     if home:
         home = str(Path(home).expanduser().resolve())
     cwd = data.get("cwd")
-    record = result(provider, cid, data.get("title"), started=started,
+    record = result("claude", cid, data.get("title"), started=started,
                     transcript=transcript, home=home,
                     cwd=cwd if isinstance(cwd, str) and Path(cwd).is_absolute() else None)
     target = report_path(pid)
@@ -462,15 +462,11 @@ def resolve_report(proc, _db_cache):
 
     provider, cid = data.get("harness", data.get("provider")), data.get("id")
     home, transcript, cwd = data.get("home"), data.get("transcript"), data.get("cwd")
-    if provider == "claude" and cid:
-        return result(provider, cid, claude_title(transcript, cid), home=home, cwd=cwd)
-    if provider == "pi" and cid:
-        # Pi creates the file lazily. An ephemeral or unsaved session cannot be resumed.
-        if isinstance(transcript, str) and Path(transcript).is_file():
-            return result(provider, cid, data.get("title"), target=transcript, cwd=cwd)
-    if provider in ("claude", "pi"):
-        return result(provider, None)
-    return None
+    if provider != "claude":
+        return None
+    if cid:
+        return result("claude", cid, claude_title(transcript, cid), home=home, cwd=cwd)
+    return result("claude", None)
 
 
 def fast_agent(path, pid):
@@ -599,7 +595,7 @@ def main():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] == "--report" and sys.argv[2] in ("claude", "pi"):
-        report(sys.argv[2])
+    if sys.argv[1:] == ["--report", "claude"]:
+        report_claude()
     else:
         main()

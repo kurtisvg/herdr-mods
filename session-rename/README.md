@@ -5,7 +5,7 @@ Automatically names each Herdr tab after the agent conversation running in it. R
 **Supported harnesses:** Jetski, Codex, Claude Code, Pi, and fast-agent
 
 Codex, Pi, and fast-agent work without setup. See the
-[session reporting guide](../integrations/README.md) for Claude Code setup
+[session reporting guide](#claude-code-setup) for Claude Code setup
 and the requirements for matching saved sessions.
 
 ![A tab named after the conversation running in it](images/tab-name.png)
@@ -51,3 +51,31 @@ and the requirements for matching saved sessions.
 - Jetski's status report currently includes the title only for resumed conversations with a saved title or after `/rename`; new auto-titled conversations rely on `sessions.py` (machines without `python3` only get reported titles).
 - To add another agent CLI, add a resolver to `HARNESSES` in `sessions.py` and optionally a status-report reader to `REPORT_TITLE` in `main.js`.
 - Herdr does not watch files behind symlinks. Run `./plugin.sh reload session-rename` after editing files or pulling updates.
+
+## Claude Code setup
+
+Configure the hook on each machine that runs Claude Code. The command can
+point to either mod’s installed `sessions.py`.
+
+Add this entry to the `hooks` object's `SessionStart` array. Merge it into
+existing hooks in `~/.claude/settings.json`.
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 '/absolute/path/to/session-rename/sessions.py' --report claude"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Claude Code titles come from title entries in the session transcript.
+A title can appear after the session ID is available for recovery.
