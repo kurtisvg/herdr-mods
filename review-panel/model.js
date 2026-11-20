@@ -1921,3 +1921,163 @@ export function tokenizeLine(line, ext) {
   }
   return out.length ? out : [[line, null]];
 }
+
+// ---------------------------------------------------------------- file links
+
+export function isAbsolutePath(path) {
+  return (
+    typeof path === "string" &&
+    (path.startsWith("/") || /^[A-Za-z]:[\\/]/.test(path))
+  );
+}
+
+export function normalizePath(path) {
+  if (typeof path !== "string" || !path) return "";
+  const windowsDrive = path.match(/^([A-Za-z]:)[\\/](.*)$/);
+  const slashNorm = path.replace(/\\/g, "/");
+  const prefix = windowsDrive
+    ? `${windowsDrive[1]}/`
+    : slashNorm.startsWith("/")
+      ? "/"
+      : "";
+  const body = windowsDrive ? windowsDrive[2].replace(/\\/g, "/") : slashNorm;
+  const parts = [];
+  for (const part of body.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (parts.length && parts[parts.length - 1] !== "..") {
+        parts.pop();
+      } else if (!prefix) {
+        parts.push("..");
+      }
+      continue;
+    }
+    parts.push(part);
+  }
+  return prefix + parts.join("/");
+}
+
+export function diskPath(root, path) {
+  if (!path) return root ?? "";
+  if (isAbsolutePath(path)) return path;
+  if (!root) return path;
+  return `${root.replace(/\/+$/, "")}/${path}`;
+}
+
+export function displayPath(path, homeDir) {
+  if (!path) return "";
+  if (!homeDir) return path;
+  const cleanHome = homeDir.replace(/\/+$/, "");
+  if (cleanHome && path.startsWith(`${cleanHome}/`)) {
+    return `~/${path.slice(cleanHome.length + 1)}`;
+  }
+  return path;
+}
+
+export function toPanelPath(request, root) {
+  const raw = normalizePath(request?.path ?? "");
+  if (!raw) return "";
+  const normRoot = normalizePath(root ?? "").replace(/\/+$/, "");
+  if (!normRoot) return raw;
+  const prefix = normRoot === "/" ? "/" : `${normRoot}/`;
+  const candidates = [raw];
+  if (request?.realpath) {
+    const real = normalizePath(request.realpath);
+    if (real && real !== raw) candidates.push(real);
+  }
+  for (const candidate of candidates) {
+    if (candidate.startsWith(prefix) && candidate.length > prefix.length) {
+      return candidate.slice(prefix.length);
+    }
+  }
+  return raw;
+}
+
+export function lineToOffset(text, line, col = 1) {
+  if (typeof text !== "string" || !text.length) return 0;
+  const targetLine = Math.max(1, Math.trunc(Number(line) || 1));
+  const targetCol = Math.max(1, Math.trunc(Number(col) || 1));
+  let currentLine = 1;
+  let lineStart = 0;
+  for (let i = 0; i < text.length && currentLine < targetLine; i++) {
+    if (text.charCodeAt(i) === 10) {
+      currentLine += 1;
+      lineStart = i + 1;
+    }
+  }
+  let lineEnd = text.indexOf("\n", lineStart);
+  if (lineEnd < 0) lineEnd = text.length;
+  if (lineEnd > lineStart && text.charCodeAt(lineEnd - 1) === 13) {
+    lineEnd -= 1;
+  }
+  return lineStart + Math.min(targetCol - 1, lineEnd - lineStart);
+}
+
+// Parses a local link clicked inside rendered markdown (relative path, absolute
+// path, or `file://` URL, with optional `#L<line>[C<col>]` or `:line[:col]`).
+// Returns null for empty paths, pure `#anchor` links, or non-file URL schemes.
+export function parseLocalLink(url, currentDiskPath) {
+  if (typeof url !== "string" || !url.trim()) return null;
+  const trimmed = url.trim();
+  if (trimmed.startsWith("#")) return null;
+
+  let body = trimmed;
+  let line = null;
+  let col = null;
+  const hashIdx = body.indexOf("#");
+  if (hashIdx >= 0) {
+    const frag = body.slice(hashIdx + 1).trim();
+    body = body.slice(0, hashIdx);
+    const m = frag.match(/^L?([1-9][0-9]*)(?:[C:]([1-9][0-9]*))?$/i);
+    if (m) {
+      line = Number(m[1]);
+      col = m[2] ? Number(m[2]) : null;
+    }
+  }
+  const qIdx = body.indexOf("?");
+  if (qIdx >= 0) body = body.slice(0, qIdx);
+  if (!body) return null;
+
+  if (/^file:\/\//i.test(body)) {
+    const rest = body.slice(7);
+    const slash = rest.indexOf("/");
+    if (slash < 0) return null;
+    const host = rest.slice(0, slash).toLowerCase();
+    if (host && host !== "localhost") return null;
+    body = rest.slice(slash);
+  } else if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(body)) {
+    return null;
+  }
+
+  let decoded;
+  try {
+    decoded = decodeURIComponent(body);
+  } catch {
+    decoded = body;
+  }
+
+  if (line === null) {
+    const withCol = decoded.match(/^(.+):([1-9][0-9]*):([1-9][0-9]*)$/);
+    const withLine = !withCol && decoded.match(/^(.+):([1-9][0-9]*)$/);
+    if (withCol) {
+      decoded = withCol[1];
+      line = Number(withCol[2]);
+      col = Number(withCol[3]);
+    } else if (withLine) {
+      decoded = withLine[1];
+      line = Number(withLine[2]);
+    }
+  }
+
+  let full;
+  if (isAbsolutePath(decoded)) {
+    full = normalizePath(decoded);
+  } else {
+    if (!currentDiskPath) return null;
+    const baseDir = currentDiskPath.replace(/\/[^/]*$/, "");
+    full = normalizePath(`${baseDir}/${decoded}`);
+  }
+  if (!full || full.endsWith("/")) return null;
+  return { path: full, line, col };
+}
+
