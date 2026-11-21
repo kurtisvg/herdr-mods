@@ -1,6 +1,6 @@
 # spaces-tab-tree
 
-Replaces Herdr's built-in `spaces` list so each space shows its tabs underneath, with repo-colored badges on git worktrees. Hover a space to fold its tabs or open a new tab (`+`), and click, double-click, drag, or right-click tabs directly from the list.
+Replaces Herdr's built-in `spaces` list so each space shows its tabs underneath, with repo-colored badges on git worktrees. Live subagents appear nested under their parent tab, where you can fold them or click a subagent to focus or peek at it. Hover a space to fold its tabs or open a new tab (`+`), and click, double-click, drag, or right-click tabs directly from the list.
 
 <img src="images/spaces-before.png" width="233" alt="Before: Herdr's spaces list with three spaces and no tabs"> <img src="images/spaces-after.png" width="233" alt="After: the same spaces with their tabs listed underneath and a colored worktree badge">
 

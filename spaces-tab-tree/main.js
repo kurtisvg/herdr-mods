@@ -14,6 +14,9 @@ import {
   spaces,
   machines,
   panes,
+  agents,
+  terminals,
+  focused,
   run,
   openOverlay,
   exec,
@@ -203,20 +206,101 @@ function syncSpaceColors(allSpaces) {
   if (changed && !checking()) setShared("space.colors", kept);
 }
 
-function tabIcon(program, isCurrent, themeColors) {
+const RANK = { blocked: 4, done: 3, working: 2, idle: 1 };
+
+// Subagents without a pane are absent from `agents()`, so fall back to the core
+// terminal status and treat "error" as "blocked". Subagents never show as "done"
+// because they report to their parent, whose own "done" notifies the user.
+function kidStatus(terminal, listed) {
+  const status = listed.get(terminal.address) ?? terminal.status;
+  if (status === "error") return "blocked";
+  if (status === "done") return "idle";
+  return status;
+}
+
+function mostUrgentStatus(statuses) {
+  let top = null;
+  for (const status of statuses) {
+    if ((RANK[status] ?? 0) > (RANK[top] ?? 0)) top = status;
+  }
+  return top;
+}
+
+function buildTerminalIndex(allTerminals) {
+  const parentOf = new Map();
+  const childrenOf = new Map();
+  for (const terminal of allTerminals) {
+    if (terminal.parent) parentOf.set(terminal.address, terminal.parent);
+    if (terminal.state !== "live" || !terminal.parent) continue;
+    const list = childrenOf.get(terminal.parent);
+    if (list) list.push(terminal);
+    else childrenOf.set(terminal.parent, [terminal]);
+  }
+  return { parentOf, childrenOf };
+}
+
+function hasAncestorIn(parentOf, addr, targets) {
+  const seen = new Set([addr]);
+  let cur = parentOf.get(addr);
+  while (cur && !seen.has(cur)) {
+    if (targets.has(cur)) return true;
+    seen.add(cur);
+    cur = parentOf.get(cur);
+  }
+  return false;
+}
+
+function subagentTree(childrenOf, parentAddress, lead = []) {
+  const kids = childrenOf.get(parentAddress) ?? [];
+  return kids.flatMap((terminal, i) => {
+    const isLast = i === kids.length - 1;
+    return [
+      { terminal, lines: [...lead, isLast ? "└" : "├"] },
+      ...subagentTree(childrenOf, terminal.address, [
+        ...lead,
+        isLast ? "" : "│",
+      ]),
+    ];
+  });
+}
+
+// Collect live subagents for all panes in a tab. Ignore panes whose ancestor is
+// another pane in the same tab so kept subagents are not listed twice.
+function tabSubagents(index, tabPanes) {
+  const tabAddrs = new Set(
+    tabPanes.map((pane) => pane.terminal).filter(Boolean),
+  );
+  if (!tabAddrs.size) return [];
+
+  const kids = [];
+  for (const addr of tabAddrs) {
+    if (hasAncestorIn(index.parentOf, addr, tabAddrs)) continue;
+    const direct = index.childrenOf.get(addr);
+    if (direct) kids.push(...direct);
+  }
+  return kids.flatMap((terminal, i) => {
+    const isLast = i === kids.length - 1;
+    return [
+      { terminal, lines: [isLast ? "└" : "├"] },
+      ...subagentTree(index.childrenOf, terminal.address, [isLast ? "" : "│"]),
+    ];
+  });
+}
+
+function tabIcon(program, isCurrent, themeColors, size = 13) {
   if (!program?.icon) {
     return svg("mods/workspace-chrome/terminal.svg")
-      .size(13)
+      .size(size)
       .flex_none()
       .text_color(themeColors.dim);
   }
   if (program.tint) {
     return svg(program.icon)
-      .size(13)
+      .size(size)
       .flex_none()
       .text_color(isCurrent ? themeColors.foreground : themeColors.muted);
   }
-  return image(program.icon).size(13).flex_none();
+  return image(program.icon).size(size).flex_none();
 }
 
 function spaceAvatar(name, fill, isWt, isNestedWt) {
@@ -309,6 +393,7 @@ export default class Spaces extends View {
     this.reconnecting = readReconnecting();
     this.folded = readStoredSet("machines.folded");
     this.collapsedTabs = readStoredSet("spaces.collapsedTabs");
+    this.collapsedSubagents = new Set();
     if (checking()) return;
 
     this.refreshMachines(cx);
@@ -709,7 +794,142 @@ export default class Spaces extends View {
     return null;
   }
 
-  tabRow(entry, tab, lead, themeColors, colorMap) {
+  subagentFoldButton(themeColors, tab, subs, listed) {
+    const subStatuses = subs.map((node) => kidStatus(node.terminal, listed));
+    const topStatus = mostUrgentStatus(subStatuses);
+    const isOpen = !this.collapsedSubagents.has(tab.id);
+
+    return h_flex()
+      .id(`sp-tab-sub-fold-${tab.id}`)
+      .flex_none()
+      .h(18)
+      .px(3)
+      .gap(3)
+      .items_center()
+      .rounded(4)
+      .text_size(10.5)
+      .text_color(
+        isOpen ? themeColors.dim : (themeColors[topStatus] ?? themeColors.dim),
+      )
+      .cursor_pointer()
+      .hover((s) => s.bg(themeColors.hover).text_color(themeColors.foreground))
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .on_click((_e, cx) => {
+        cx.stop_propagation();
+        if (isOpen) this.collapsedSubagents.add(tab.id);
+        else this.collapsedSubagents.delete(tab.id);
+        cx.notify();
+      })
+      .child(
+        svg(`mods/workspace-chrome/chevron-${isOpen ? "down" : "right"}.svg`)
+          .size(11)
+          .flex_none(),
+      )
+      .when(!isOpen, (button) => button.child(String(subs.length)));
+  }
+
+  subagentRow(entry, tab, node, themeColors, colorMap, listed, shownAddress) {
+    const { w: space, tree, parent } = entry;
+    const { terminal, lines } = node;
+    const ownerId = tree && parent ? parent.id : space.id;
+    const fill = spaceFill(ownerId, themeColors, colorMap);
+    const status = kidStatus(terminal, listed);
+    const statusEl = this.tabStatus(themeColors, status);
+    const isShown = terminal.address === shownAddress;
+    const name =
+      terminal.name ||
+      terminal.template ||
+      terminal.program?.name ||
+      terminal.address;
+
+    const pill = h_flex()
+      .id(`sp-sub-${tab.id}-${terminal.address}`)
+      .flex_1()
+      .min_w(0)
+      .h(23)
+      .pl(13)
+      .pr(7)
+      .gap(0)
+      .rounded(6)
+      .items_center()
+      .cursor_pointer()
+      .when(isShown, (el) => el.bg(themeColors.raised))
+      .when(!isShown, (el) => el.hover((s) => s.bg(themeColors.hover)))
+      .on_click(() => {
+        if (listed.has(terminal.address)) {
+          run("pane.focus", { terminal: terminal.address });
+        } else {
+          run("terminal.peek", { terminal: terminal.address });
+        }
+      })
+      .children(
+        lines.map((segment) =>
+          div()
+            .self_start()
+            .mt(segment === "│" ? 0 : -4)
+            .w(9)
+            .h(segment === "│" ? 23 : 15)
+            .mr(4)
+            .flex_none()
+            .when(Boolean(segment), (line) =>
+              line.border_l(1.5).border_color(themeColors.input),
+            )
+            .when(segment === "└" || segment === "├", (line) =>
+              line.border_b(1.5).rounded_bl(6),
+            ),
+        ),
+      )
+      .child(
+        div()
+          .mr(6)
+          .flex_none()
+          .child(tabIcon(terminal.program, isShown, themeColors, 12)),
+      )
+      .child(
+        div()
+          .flex_1()
+          .min_w(0)
+          .truncate()
+          .text_size(12)
+          .text_color(isShown ? themeColors.foreground : themeColors.muted)
+          .child(name),
+      )
+      .when(Boolean(statusEl), (el) =>
+        el.child(div().ml(6).flex_none().child(statusEl)),
+      );
+
+    return h_flex()
+      .id(`sp-sub-row-${tab.id}-${terminal.address}`)
+      .flex_none()
+      .h(23)
+      .pl(16)
+      .items_center()
+      .when(!tree, (el) =>
+        el.child(
+          div()
+            .w(1)
+            .h_full()
+            .mr(8)
+            .flex_none()
+            .bg(entry.g?.linked ? alpha(fill, "66") : themeColors.border),
+        ),
+      )
+      .when(Boolean(tree), (el) =>
+        el
+          .child(
+            div()
+              .w(1)
+              .h_full()
+              .mr(21)
+              .flex_none()
+              .when(tree === "├─", (line) => line.bg(themeColors.border)),
+          )
+          .child(div().w(1.5).h_full().mr(7).flex_none().bg(alpha(fill, "66"))),
+      )
+      .child(pill);
+  }
+
+  tabRow(entry, tab, lead, subs, listed, themeColors, colorMap) {
     const { w: space, tree, parent } = entry;
     const isCurrent = space.active && tab.active;
     const name = tabLabel(tab, lead);
@@ -833,6 +1053,9 @@ export default class Spaces extends View {
           .text_size(12.5)
           .text_color(isCurrent ? themeColors.foreground : themeColors.muted)
           .child(tab.zoomed ? `${name} Z` : name),
+      )
+      .when(subs.length > 0, (el) =>
+        el.child(this.subagentFoldButton(themeColors, tab, subs, listed)),
       )
       .when(hovered, (el) =>
         el.child(
@@ -1130,11 +1353,23 @@ export default class Spaces extends View {
   }
 
   // Build list children, adding machine headers once any remote machine is known.
-  grouped(themeColors, collapsed, allSpaces, allPanes) {
+  grouped(themeColors, collapsed, allSpaces, allPanes, shownAddress) {
     const rows = this.ordered(allSpaces, allPanes);
     const colorMap = plainObject(shared("space.colors")) ?? {};
     this.syncWorktrees(rows, themeColors, colorMap);
-    const leads = leadPanes(allPanes);
+    const leads = collapsed ? null : leadPanes(allPanes);
+    const listed = collapsed
+      ? null
+      : new Map(agents().map((agent) => [agent.address, agent.status]));
+    const termIndex = collapsed ? null : buildTerminalIndex(terminals());
+    const panesByTab = new Map();
+    if (!collapsed) {
+      for (const pane of allPanes) {
+        const list = panesByTab.get(pane.tab);
+        if (list) list.push(pane);
+        else panesByTab.set(pane.tab, [pane]);
+      }
+    }
 
     const drawSpace = (entry, offset) => {
       if (collapsed) {
@@ -1143,15 +1378,45 @@ export default class Spaces extends View {
       }
       const tabs = entry.w.tabs ?? [];
       const showTabs = tabs.length > 0 && !this.collapsedTabs.has(entry.w.id);
-      if (entry.w.active) {
-        const ti = showTabs ? tabs.findIndex((c) => c.active) : -1;
-        this.activeAt = offset + (ti >= 0 ? 1 + ti : 0);
+      if (entry.w.active) this.activeAt = offset;
+      const tabRows = [];
+      if (showTabs) {
+        for (const tab of tabs) {
+          const subs = tabSubagents(termIndex, panesByTab.get(tab.id) ?? []);
+          if (entry.w.active && tab.active) {
+            this.activeAt = offset + 1 + tabRows.length;
+          }
+          tabRows.push(
+            this.tabRow(
+              entry,
+              tab,
+              leads.get(tab.id),
+              subs,
+              listed,
+              themeColors,
+              colorMap,
+            ),
+          );
+          if (!this.collapsedSubagents.has(tab.id)) {
+            for (const node of subs) {
+              if (node.terminal.address === shownAddress) {
+                this.activeAt = offset + 1 + tabRows.length;
+              }
+              tabRows.push(
+                this.subagentRow(
+                  entry,
+                  tab,
+                  node,
+                  themeColors,
+                  colorMap,
+                  listed,
+                  shownAddress,
+                ),
+              );
+            }
+          }
+        }
       }
-      const tabRows = showTabs
-        ? tabs.map((tab) =>
-            this.tabRow(entry, tab, leads.get(tab.id), themeColors, colorMap),
-          )
-        : [];
       return [this.row(entry, themeColors, colorMap), ...tabRows];
     };
 
@@ -1464,14 +1729,21 @@ export default class Spaces extends View {
     const collapsed = narrow();
     const allSpaces = spaces();
     const allPanes = panes();
+    const shownAddress = collapsed ? null : focused()?.agent;
     syncSpaceColors(allSpaces);
-    const list = this.grouped(themeColors, collapsed, allSpaces, allPanes);
+    const list = this.grouped(
+      themeColors,
+      collapsed,
+      allSpaces,
+      allPanes,
+      shownAddress,
+    );
 
-    // Scroll the active space or tab into view when it or its position changes.
+    // Scroll the active space, tab, or subagent into view when it or its position changes.
     // A row already visible stays put.
     const activeSpace = allSpaces.find((space) => space.active);
     const activeTab = activeSpace?.tabs?.find((tab) => tab.active);
-    const active = `${activeSpace?.id ?? ""}:${activeTab?.id ?? ""}`;
+    const active = `${activeSpace?.id ?? ""}:${activeTab?.id ?? ""}:${shownAddress ?? ""}`;
     if (active !== this.revealed || this.activeAt !== this.revealedAt) {
       this.revealed = active;
       this.revealedAt = this.activeAt;
