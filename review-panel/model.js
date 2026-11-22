@@ -831,41 +831,474 @@ export function parseFrontmatter(text) {
   };
 }
 
-// Splits a markdown file into clickable visual blocks: [{ kind, from, to, text }]
-// with 1-based inclusive line numbers. Leading YAML frontmatter (`kind: "frontmatter"`)
-// carries parsed `entries`. Mermaid blocks (`kind: "mermaid"`) carry `code` without
-// fences. When `where` is given (see liftPictures), blocks that reference local
-// pictures also carry `pictures` and `shown`.
+const QUOTE_RE = /^ {0,3}>/;
+const FENCE_OPEN_RE = /^ {0,3}(?:(`{3,})([^`]*)|(~{3,})(.*))$/;
+const FENCE_CLOSE_RE = /^ {0,3}(`{3,}|~{3,})\s*$/;
+const HEADING_RE = /^ {0,3}#{1,6}(\s|$)/;
+const RULE_RE = /^ {0,3}([-*_])( *\1){2,}\s*$/;
+const SETEXT_RE = /^ {0,3}(=+|-+)\s*$/;
+const TABLE_RE = /^ {0,3}\|/;
+const LIST_ITEM_RE = /^ {0,3}([-*+]|\d{1,9}[.)])\s/;
+const INDENTED_RE = /^(\t| {2,})\S/;
+
+function closesFence(line, fence) {
+  const end = FENCE_CLOSE_RE.exec(line);
+  return Boolean(end && end[1][0] === fence.char && end[1].length >= fence.length);
+}
+
+// Removes one leading CommonMark blockquote marker (`>` with up to 3 leading
+// spaces and an optional following space or tab).
+function stripQuoteMarker(line) {
+  const match = QUOTE_RE.exec(line);
+  if (!match) return line;
+  const rest = line.slice(match[0].length);
+  if (rest.startsWith(" ")) return rest.slice(1);
+  // CommonMark: a tab right after `>` supplies the optional 1-space separator
+  // and leaves 3 spaces toward the 4-column tab stop.
+  if (rest.startsWith("\t")) return "   " + rest.slice(1);
+  return rest;
+}
+
+// Updates a blockquote's inner fence state and whether a plain line without `>`
+// may lazily continue it. Called for each `>`-prefixed line (lazy continuations
+// are always plain paragraph lines and leave `lazyOk` true).
+function updateQuoteState(cur, inner) {
+  if (cur.innerFence) {
+    if (closesFence(inner, cur.innerFence)) cur.innerFence = null;
+    cur.lazyOk = false;
+    return;
+  }
+  const fence = FENCE_OPEN_RE.exec(inner);
+  if (fence) {
+    const mark = fence[1] ?? fence[3];
+    cur.innerFence = { char: mark[0], length: mark.length };
+    cur.lazyOk = false;
+    return;
+  }
+  if (
+    !inner.trim() ||
+    HEADING_RE.test(inner) ||
+    RULE_RE.test(inner) ||
+    TABLE_RE.test(inner) ||
+    QUOTE_RE.test(inner) ||
+    (cur.lazyOk && SETEXT_RE.test(inner))
+  ) {
+    cur.lazyOk = false;
+    return;
+  }
+  cur.lazyOk = true;
+}
+
+// Splits a non-mermaid fenced code block into one commentable `code` block per
+// body line, keeping exact 1-based line numbers and a shared `codeGroup`.
+function codeBlocks(cur, codeGroup, quoteMeta) {
+  const bodyEnd = cur.closed ? cur.lines.length - 1 : cur.lines.length;
+  if (bodyEnd <= 1) {
+    return [
+      {
+        kind: "code",
+        from: cur.from,
+        to: cur.from + cur.lines.length - 1,
+        text: "",
+        lang: cur.lang,
+        codeGroup,
+        ...quoteMeta,
+      },
+    ];
+  }
+  const blocks = [];
+  for (let k = 1; k < bodyEnd; k++) {
+    blocks.push({
+      kind: "code",
+      from: cur.from + k,
+      to: cur.from + k,
+      text: cur.lines[k],
+      lang: cur.lang,
+      codeGroup,
+      ...quoteMeta,
+    });
+  }
+  return blocks;
+}
+
+// Splits a valid GFM table into one commentable `table-row` block per row
+// (header + delimiter share the first block) with shared column alignments and
+// proportional weights. Returns null if `cur.lines` is not a valid GFM table.
+function tableBlocks(cur, tableGroup, quoteMeta) {
+  if (cur.lines.length < 2) return null;
+  const headerCells = splitTableRow(cur.lines[0]);
+  const sepCells = splitTableRow(cur.lines[1]);
+  const rawAligns = parseTableDelimiter(sepCells);
+  if (!headerCells || !rawAligns) return null;
+
+  const bodyRows = cur.lines
+    .slice(2)
+    .map((line) => splitTableRow(line) ?? [line.trim()]);
+  const cols = Math.max(
+    headerCells.length,
+    rawAligns.length,
+    ...bodyRows.map((row) => row.length),
+  );
+  const pad = (row) =>
+    Array.from({ length: cols }, (_, c) => (row[c] ?? "").trim());
+  const alignments = Array.from({ length: cols }, (_, c) => {
+    const a = rawAligns[c] ?? "left";
+    return a === "left-explicit" ? "left" : a;
+  });
+
+  const paddedHeader = pad(headerCells);
+  const paddedBody = bodyRows.map(pad);
+  const allRows = [paddedHeader, ...paddedBody];
+  const weights = Array.from({ length: cols }, (_, c) => {
+    const maxLen = Math.max(...allRows.map((row) => row[c].length));
+    return Math.max(4, Math.min(40, maxLen));
+  });
+
+  const blocks = [
+    {
+      kind: "table-row",
+      from: cur.from,
+      to: cur.from + 1,
+      header: true,
+      cells: paddedHeader,
+      alignments,
+      weights,
+      tableGroup,
+      text: cur.lines.slice(0, 2).join("\n"),
+      ...quoteMeta,
+    },
+  ];
+  for (let k = 0; k < paddedBody.length; k++) {
+    blocks.push({
+      kind: "table-row",
+      from: cur.from + 2 + k,
+      to: cur.from + 2 + k,
+      header: false,
+      cells: paddedBody[k],
+      alignments,
+      weights,
+      tableGroup,
+      text: cur.lines[2 + k],
+      ...quoteMeta,
+    });
+  }
+  return blocks;
+}
+
+const WORD_CHAR_RE = /[A-Za-z0-9]/;
+const NARROW_CHAR_RE = /[ilItfjr1.,:;!|'()[\]{}]/;
+const WIDE_CHAR_RE = /[mwMW@%&]/;
+const UPPER_DIGIT_RE = /[A-Z0-9]/;
+
+// Estimates the rendered pixel width of a Markdown inline token at `fontSize`,
+// ignoring hidden link destinations and formatting markers.
+function measureInlineWidth(token, fontSize = 13) {
+  let width = 0;
+  let i = 0;
+  while (i < token.length) {
+    if (token[i] === "\\" && i + 1 < token.length) {
+      i += 1;
+    } else if (token[i] === "`") {
+      const end = scanCodeSpan(token, i);
+      if (end > 0) {
+        let ticks = 0;
+        while (token[i + ticks] === "`") ticks += 1;
+        const inner = token.slice(i + ticks, end - ticks);
+        width += inner.length * fontSize * 0.6;
+        i = end;
+        continue;
+      }
+    } else if (token[i] === "[") {
+      const closeBracket = token.indexOf("]", i + 1);
+      if (closeBracket > i && token[closeBracket + 1] === "(") {
+        const closeParen = token.indexOf(")", closeBracket + 2);
+        if (closeParen > closeBracket + 1) {
+          width += measureInlineWidth(token.slice(i + 1, closeBracket), fontSize);
+          i = closeParen + 1;
+          continue;
+        }
+      }
+    } else if (
+      token.startsWith("**", i) ||
+      token.startsWith("__", i) ||
+      token.startsWith("~~", i)
+    ) {
+      i += 2;
+      continue;
+    } else if (token[i] === "*" || token[i] === "_") {
+      const prev = i > 0 ? token[i - 1] : "";
+      const next = i + 1 < token.length ? token[i + 1] : "";
+      if (!(token[i] === "_" && WORD_CHAR_RE.test(prev) && WORD_CHAR_RE.test(next))) {
+        i += 1;
+        continue;
+      }
+    }
+    const ch = token[i];
+    if (ch === " ") width += fontSize * 0.28;
+    else if (NARROW_CHAR_RE.test(ch)) width += fontSize * 0.34;
+    else if (WIDE_CHAR_RE.test(ch)) width += fontSize * 0.78;
+    else if (UPPER_DIGIT_RE.test(ch)) width += fontSize * 0.62;
+    else width += fontSize * 0.53;
+    i += 1;
+  }
+  return width;
+}
+
+// Scans one line into atomic inline tokens so links and code spans stay intact.
+function tokenizeParagraphLine(line, lineNum, fontSize) {
+  const tokens = [];
+  let i = 0;
+  while (i < line.length) {
+    while (i < line.length && (line[i] === " " || line[i] === "\t")) i += 1;
+    if (i >= line.length) break;
+    const start = i;
+    while (i < line.length && line[i] !== " " && line[i] !== "\t") {
+      if (line[i] === "\\" && i + 1 < line.length) {
+        i += 2;
+        continue;
+      }
+      if (line[i] === "`") {
+        const end = scanCodeSpan(line, i);
+        if (end > 0) {
+          i = end;
+          continue;
+        }
+      }
+      if (line[i] === "[") {
+        const closeBracket = line.indexOf("]", i + 1);
+        if (closeBracket > i && line[closeBracket + 1] === "(") {
+          const closeParen = line.indexOf(")", closeBracket + 2);
+          if (closeParen > closeBracket + 1) {
+            i = closeParen + 1;
+            continue;
+          }
+        }
+      }
+      i += 1;
+    }
+    const text = line.slice(start, i);
+    tokens.push({ text, line: lineNum, width: measureInlineWidth(text, fontSize) });
+  }
+  return tokens;
+}
+
+// Balances inline Markdown formatting spans (`**`, `__`, `~~`, `*`, `_`, and
+// backtick code spans) across lines when a paragraph is split into visual
+// lines so each line renders cleanly on its own.
+function splitParagraphLines(lines) {
+  if (!lines.some((l) => /[*_~`]/.test(l))) return lines;
+  const stack = [];
+  const out = [];
+
+  for (const line of lines) {
+    const leadMatch = /^[ \t]*/.exec(line);
+    const lead = leadMatch[0];
+    const body = line.slice(lead.length).trimEnd();
+    const prefix = stack.join("");
+
+    let i = 0;
+    while (i < line.length) {
+      const ch = line[i];
+      const top = stack[stack.length - 1];
+      if (top && top[0] === "`") {
+        if (ch === "`") {
+          let j = i;
+          while (j < line.length && line[j] === "`") j += 1;
+          if (j - i === top.length) stack.pop();
+          i = j;
+          continue;
+        }
+        i += 1;
+        continue;
+      }
+      if (ch === "\\" && i + 1 < line.length) {
+        i += 2;
+        continue;
+      }
+      if (ch === "`") {
+        let j = i;
+        while (j < line.length && line[j] === "`") j += 1;
+        stack.push(line.slice(i, j));
+        i = j;
+        continue;
+      }
+      if (ch !== "*" && ch !== "_" && ch !== "~") {
+        i += 1;
+        continue;
+      }
+      let mark = null;
+      if (line[i + 1] === ch) {
+        mark = ch + ch;
+      } else if (ch === "*" || ch === "_") {
+        mark = ch;
+      }
+      if (!mark) {
+        i += 1;
+        continue;
+      }
+      const prev = i > 0 ? line[i - 1] : "";
+      const next = i + mark.length < line.length ? line[i + mark.length] : "";
+      const intraword =
+        ch === "_" && WORD_CHAR_RE.test(prev) && WORD_CHAR_RE.test(next);
+      if (!intraword) {
+        const idx = stack.lastIndexOf(mark);
+        const canClose = idx >= 0 && prev && !/\s/.test(prev);
+        const canOpen = next && !/\s/.test(next);
+        if (canClose) {
+          stack.splice(idx, 1);
+        } else if (canOpen) {
+          stack.push(mark);
+        }
+      }
+      i += mark.length;
+    }
+
+    const suffix = [...stack].reverse().join("");
+    out.push(body ? `${lead}${prefix}${body}${suffix}` : line);
+  }
+  return out;
+}
+
+const LIST_MARKER_RE = /^ {0,3}([-*+]|\d{1,9}[.)])\s+(?:\[([ xX])\]\s+)?/;
+
+function isSimpleListItem(lines) {
+  for (let k = 1; k < lines.length; k++) {
+    const trimmed = lines[k].trim();
+    if (
+      !trimmed ||
+      LIST_ITEM_RE.test(trimmed) ||
+      FENCE_OPEN_RE.test(trimmed) ||
+      QUOTE_RE.test(trimmed) ||
+      HEADING_RE.test(trimmed) ||
+      RULE_RE.test(trimmed) ||
+      TABLE_RE.test(trimmed)
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Re-wraps a paragraph or simple list-item block to `maxWidthPx` (logical px
+// at `fontSize`) into per-visual-line commentable blocks, preserving each
+// visual line's source line range (`from`/`to`) and balancing inline
+// formatting across splits.
+export function wrapParagraphBlock(block, maxWidthPx, paraGroup, fontSize = 13) {
+  const raw = block.shown ?? block.text;
+  if ((!block.para && !block.listItem) || !raw.trim() || !maxWidthPx || maxWidthPx <= 0) {
+    return [block];
+  }
+  const srcLines = raw.split("\n");
+  let listMarker = null;
+  let listIndent = 0;
+  if (block.listItem) {
+    const match = LIST_MARKER_RE.exec(srcLines[0]);
+    if (!match) return [block];
+    listMarker =
+      match[2] === "x" || match[2] === "X"
+        ? "☑"
+        : match[2] === " "
+          ? "☐"
+          : /^\d/.test(match[1])
+            ? match[1]
+            : "•";
+    listIndent = Math.max(18, Math.ceil(measureInlineWidth(listMarker, fontSize) + 8));
+    srcLines[0] = srcLines[0].slice(match[0].length);
+    for (let idx = 1; idx < srcLines.length; idx++) {
+      srcLines[idx] = srcLines[idx].trimStart();
+    }
+  }
+  const effectiveWidth = maxWidthPx - listIndent;
+  if (effectiveWidth <= 0) return [block];
+
+  const segments = [];
+  let curTokens = [];
+  for (let idx = 0; idx < srcLines.length; idx++) {
+    const line = srcLines[idx];
+    const hardBreak = /(?: {2,}|\\)$/.test(line);
+    const cleaned = hardBreak ? line.replace(/(?: {2,}|\\)$/, "") : line;
+    curTokens.push(...tokenizeParagraphLine(cleaned, block.from + idx, fontSize));
+    if (hardBreak) {
+      if (curTokens.length) segments.push(curTokens);
+      curTokens = [];
+    }
+  }
+  if (curTokens.length) segments.push(curTokens);
+
+  const limit = effectiveWidth * 0.93;
+  const spaceW = fontSize * 0.28;
+  const wrapped = [];
+
+  for (const tokens of segments) {
+    let lineTokens = [];
+    let lineWidth = 0;
+    const flush = () => {
+      if (!lineTokens.length) return;
+      wrapped.push({
+        from: lineTokens[0].line,
+        to: lineTokens[lineTokens.length - 1].line,
+        text: lineTokens.map((tok) => tok.text).join(" "),
+      });
+      lineTokens = [];
+      lineWidth = 0;
+    };
+    for (const tok of tokens) {
+      const nextWidth = lineTokens.length ? lineWidth + spaceW + tok.width : tok.width;
+      if (lineTokens.length && nextWidth > limit) flush();
+      lineTokens.push(tok);
+      lineWidth = lineTokens.length === 1 ? tok.width : lineWidth + spaceW + tok.width;
+    }
+    flush();
+  }
+
+  if (wrapped.length <= 1) return [block];
+  const balanced = splitParagraphLines(wrapped.map((w) => w.text));
+  return wrapped.map((w, k) => {
+    const item = {
+      kind: "md",
+      from: w.from,
+      to: w.to,
+      text: balanced[k],
+      paraGroup,
+    };
+    if (block.para) item.para = true;
+    if (block.listItem) {
+      item.listItem = true;
+      item.listMarker = k === 0 ? listMarker : "";
+      item.listIndent = listIndent;
+    }
+    if (block.quote) {
+      item.quote = block.quote;
+      item.quoteGroup = block.quoteGroup;
+    }
+    if (block.pictures && k === wrapped.length - 1) {
+      item.pictures = block.pictures;
+    }
+    return item;
+  });
+}
+
+// Splits a markdown file into clickable visual blocks with 1-based inclusive
+// line numbers:
+//   - `frontmatter` leading YAML frontmatter carrying parsed `entries`
+//   - `md`          markdown text (paragraphs, headings, list items, rules)
+//   - `mermaid`     mermaid diagram block carrying `code` without fences
+//   - `code`        one line of a fenced code block (`lang`, `codeGroup`)
+//   - `table-row`   one row of a GFM table (`header`, `cells`, `alignments`,
+//                   `weights`, `tableGroup`)
+// Blocks inside blockquotes are split recursively and carry `quote` (nesting
+// depth) and `quoteGroup` (shared by parts of one quote) with outer `>` markers
+// stripped from `text`. When `where` is given (see liftPictures), blocks that
+// reference local pictures also carry `pictures` and `shown` (or `shownCells`).
 export function markdownBlocks(text, where) {
   const src = text
     .replace(/\n$/, "")
     .split("\n")
     .map((line) => line.replace(/\r$/, ""));
   const out = [];
-  let cur = null;
-
-  const close = () => {
-    if (!cur) return;
-    while (cur.lines.length && !cur.lines[cur.lines.length - 1].trim()) {
-      cur.lines.pop();
-    }
-    const block = {
-      kind: cur.mermaid ? "mermaid" : "md",
-      from: cur.from,
-      to: cur.from + cur.lines.length - 1,
-      text: cur.lines.join("\n"),
-    };
-    if (cur.mermaid) {
-      block.code = cur.lines.slice(1, cur.closed ? -1 : undefined).join("\n");
-    }
-    out.push(block);
-    cur = null;
-  };
-  const start = (type, i, extra) => {
-    close();
-    cur = { type, from: i + 1, lines: [src[i]], ...extra };
-  };
-  const indented = (line) => /^(\t| {2,})\S/.test(line);
+  let quoteGroups = 0;
+  let codeGroups = 0;
+  let tableGroups = 0;
 
   let startLine = 0;
   const fm = parseFrontmatterLines(src);
@@ -880,86 +1313,173 @@ export function markdownBlocks(text, where) {
     startLine = fm.endLine;
   }
 
-  for (let i = startLine; i < src.length; i++) {
-    const line = src[i];
-    if (cur?.type === "fence") {
-      cur.lines.push(line);
-      const end = /^ {0,3}(`{3,}|~{3,})\s*$/.exec(line);
-      if (end && end[1][0] === cur.char && end[1].length >= cur.length) {
-        cur.closed = true;
-        close();
+  const parse = (lines, baseLine, quoteDepth, quoteGroup) => {
+    let cur = null;
+    const quoteMeta = quoteDepth > 0 ? { quote: quoteDepth, quoteGroup } : {};
+
+    const close = () => {
+      if (!cur) return;
+      if (cur.type === "quote") {
+        const group = quoteGroup ?? ++quoteGroups;
+        const inner = cur.lines.map(stripQuoteMarker);
+        const startLine = cur.from;
+        cur = null;
+        parse(inner, startLine, quoteDepth + 1, group);
+        return;
       }
-      continue;
-    }
-    const fence = /^ {0,3}(?:(`{3,})([^`]*)|(~{3,})(.*))$/.exec(line);
-    if (fence) {
-      const mark = fence[1] ?? fence[3];
-      const lang = /^\s*\{?\.?([^\s`}]*)/.exec(fence[2] ?? fence[4])[1];
-      start("fence", i, {
-        char: mark[0],
-        length: mark.length,
-        mermaid: lang.toLowerCase() === "mermaid",
-      });
-      continue;
-    }
-    if (!line.trim()) {
-      // Blank lines end a block unless a list item continues indented below.
-      let next = i + 1;
-      while (next < src.length && !src[next].trim()) next++;
-      if (cur?.type === "item" && next < src.length && indented(src[next])) {
+      if (cur.type === "fence" && !cur.mermaid) {
+        out.push(...codeBlocks(cur, ++codeGroups, quoteMeta));
+        cur = null;
+        return;
+      }
+      while (cur.lines.length && !cur.lines[cur.lines.length - 1].trim()) {
+        cur.lines.pop();
+      }
+      if (!cur.lines.length) {
+        cur = null;
+        return;
+      }
+      if (cur.type === "table") {
+        const rows = tableBlocks(cur, tableGroups + 1, quoteMeta);
+        if (rows) {
+          tableGroups += 1;
+          out.push(...rows);
+          cur = null;
+          return;
+        }
+      }
+      const block = {
+        kind: cur.mermaid ? "mermaid" : "md",
+        from: cur.from,
+        to: cur.from + cur.lines.length - 1,
+        text: cur.lines.join("\n"),
+        ...(cur.type === "para" && !cur.setext ? { para: true } : {}),
+        ...(cur.type === "item" && isSimpleListItem(cur.lines)
+          ? { listItem: true }
+          : {}),
+        ...quoteMeta,
+      };
+      if (cur.mermaid) {
+        block.code = cur.lines.slice(1, cur.closed ? -1 : undefined).join("\n");
+      }
+      out.push(block);
+      cur = null;
+    };
+    const start = (type, i, extra) => {
+      close();
+      cur = { type, from: baseLine + i, lines: [lines[i]], ...extra };
+    };
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (cur?.type === "fence") {
+        cur.lines.push(line);
+        if (closesFence(line, cur)) {
+          cur.closed = true;
+          close();
+        }
+        continue;
+      }
+      const fence = FENCE_OPEN_RE.exec(line);
+      if (fence) {
+        const mark = fence[1] ?? fence[3];
+        const lang = /^\s*\{?\.?([^\s`}]*)/.exec(fence[2] ?? fence[4])[1].toLowerCase();
+        start("fence", i, {
+          char: mark[0],
+          length: mark.length,
+          lang,
+          mermaid: lang === "mermaid",
+        });
+        continue;
+      }
+      if (!line.trim()) {
+        // Blank lines end a block unless a list item continues indented below.
+        let next = i + 1;
+        while (next < lines.length && !lines[next].trim()) next++;
+        if (cur?.type === "item" && next < lines.length && INDENTED_RE.test(lines[next])) {
+          cur.lines.push(line);
+        } else {
+          close();
+        }
+        continue;
+      }
+      if (HEADING_RE.test(line)) {
+        start("heading", i);
+        close();
+        continue;
+      }
+      if (cur?.type === "para" && SETEXT_RE.test(line)) {
+        cur.lines.push(line);
+        cur.setext = true;
+        close();
+        continue;
+      }
+      if (RULE_RE.test(line)) {
+        start("rule", i);
+        close();
+        continue;
+      }
+      if (cur?.type === "item" && INDENTED_RE.test(line)) {
+        cur.lines.push(line);
+        continue;
+      }
+      if (LIST_ITEM_RE.test(line)) {
+        start("item", i);
+        continue;
+      }
+      if (QUOTE_RE.test(line)) {
+        if (cur?.type === "quote") {
+          cur.lines.push(line);
+        } else {
+          start("quote", i, { innerFence: null, lazyOk: false });
+        }
+        updateQuoteState(cur, stripQuoteMarker(line));
+        continue;
+      }
+      const type = TABLE_RE.test(line) ? "table" : "para";
+      // Limit lazy continuation to top-level quotes so shallower `>` lines do
+      // not get absorbed into a nested quote.
+      const continuesQuote =
+        type === "para" &&
+        cur?.type === "quote" &&
+        quoteDepth === 0 &&
+        cur.lazyOk &&
+        !SETEXT_RE.test(line);
+      const continues =
+        cur &&
+        (cur.type === type ||
+          (type === "para" && cur.type === "item") ||
+          continuesQuote);
+      if (continues) {
         cur.lines.push(line);
       } else {
-        close();
+        start(type, i);
       }
-      continue;
     }
-    if (/^ {0,3}#{1,6}(\s|$)/.test(line)) {
-      start("heading", i);
-      close();
-      continue;
-    }
-    if (cur?.type === "para" && /^ {0,3}(=+|-+)\s*$/.test(line)) {
-      cur.lines.push(line);
-      close();
-      continue;
-    }
-    if (/^ {0,3}([-*_])( *\1){2,}\s*$/.test(line)) {
-      start("rule", i);
-      close();
-      continue;
-    }
-    if (cur?.type === "item" && indented(line)) {
-      cur.lines.push(line);
-      continue;
-    }
-    if (/^ {0,3}([-*+]|\d{1,9}[.)])\s/.test(line)) {
-      start("item", i);
-      continue;
-    }
-    const type = /^ {0,3}\|/.test(line)
-      ? "table"
-      : /^ {0,3}>/.test(line)
-        ? "quote"
-        : "para";
-    if (
-      cur &&
-      (cur.type === type ||
-        (type === "para" && (cur.type === "item" || cur.type === "quote")))
-    ) {
-      cur.lines.push(line);
-    } else {
-      start(type, i);
-    }
-  }
-  close();
+    close();
+  };
+
+  parse(src.slice(startLine), startLine + 1, 0, null);
 
   if (where) {
     for (const block of out) {
-      if (block.kind !== "md") continue;
-      const lifted = liftPictures(block.text, where);
-      if (lifted.pictures.length) {
-        block.shown = lifted.text;
-        block.pictures = lifted.pictures;
+      if (block.kind === "md") {
+        const lifted = liftPictures(block.text, where);
+        if (lifted.pictures.length) {
+          block.shown = lifted.text;
+          block.pictures = lifted.pictures;
+        }
+      } else if (block.kind === "table-row") {
+        const pictures = [];
+        const shownCells = block.cells.map((cell) => {
+          const lifted = liftPictures(cell, where);
+          pictures.push(...lifted.pictures);
+          return lifted.text;
+        });
+        if (pictures.length) {
+          block.shownCells = shownCells;
+          block.pictures = pictures;
+        }
       }
     }
   }
