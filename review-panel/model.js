@@ -1993,3 +1993,82 @@ export function tokenizeLine(line, ext) {
   }
   return out.length ? out : [[line, null]];
 }
+
+function hasNonSpace(text, start, end) {
+  for (let i = start; i < end; i++) {
+    if (text[i] !== " ") return true;
+  }
+  return false;
+}
+
+function splitsSurrogatePair(text, index) {
+  const prev = text.charCodeAt(index - 1);
+  const next = text.charCodeAt(index);
+  return prev >= 0xd800 && prev <= 0xdbff && next >= 0xdc00 && next <= 0xdfff;
+}
+
+function wrapLengths(text, limit) {
+  const lengths = [];
+  let pos = 0;
+  while (pos < text.length) {
+    if (text.length - pos <= limit) {
+      lengths.push(text.length - pos);
+      break;
+    }
+    let end = pos + limit;
+    if (splitsSurrogatePair(text, end)) {
+      // Keep the full surrogate pair when limit is 1 so each step advances.
+      end = limit > 1 ? end - 1 : end + 1;
+    }
+    const space = text.lastIndexOf(" ", end - 1);
+    const cut =
+      space >= pos && hasNonSpace(text, pos, space) ? space + 1 : end;
+    lengths.push(cut - pos);
+    pos = cut;
+  }
+  return lengths;
+}
+
+// Splits a line's `[text, kind]` syntax spans into visual lines that fit within
+// `maxCols` columns. Prefers breaking after spaces once non-space text appears,
+// falls back to a hard character break for unbroken tokens, and preserves every
+// character and its token kind.
+export function wrapSpans(spans, maxCols) {
+  if (!spans.length) return [[]];
+  const limit = Math.floor(maxCols);
+  if (!Number.isFinite(limit) || limit < 1) return [spans];
+
+  let total = 0;
+  for (const [text] of spans) total += text.length;
+  if (total <= limit) return [spans];
+
+  const lengths = wrapLengths(
+    spans.map(([text]) => text).join(""),
+    limit,
+  );
+  const lines = [];
+  let spanIndex = 0;
+  let offset = 0;
+  for (let remaining of lengths) {
+    const line = [];
+    while (remaining > 0 && spanIndex < spans.length) {
+      const [text, kind] = spans[spanIndex];
+      const available = text.length - offset;
+      if (available <= 0) {
+        spanIndex += 1;
+        offset = 0;
+        continue;
+      }
+      const take = Math.min(remaining, available);
+      line.push([text.slice(offset, offset + take), kind]);
+      offset += take;
+      remaining -= take;
+      if (offset === text.length) {
+        spanIndex += 1;
+        offset = 0;
+      }
+    }
+    lines.push(line);
+  }
+  return lines;
+}
