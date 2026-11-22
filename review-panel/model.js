@@ -479,10 +479,363 @@ export function textKey(text) {
   return hash.toString(16).padStart(8, "0");
 }
 
+// ---------------------------------------------------------------- yaml frontmatter
+
+const YAML_KEY =
+  /^("(?:\\.|[^"\\])*"|'(?:''|[^'])*'|[^\s:#][^:#]*?)[ \t]*:(?:[ \t]+(.*)|[ \t]*)$/;
+const YAML_BLOCK_SCALAR = /^([|>])([+-]?|[1-9][+-]?|[+-][1-9]?)[ \t]*(?:#.*)?$/;
+const YAML_BLANK_OR_COMMENT = /^[ \t]*(?:#.*)?$/;
+const YAML_SEQ_ITEM = /^( *)-(?:[ \t]+(.*)|[ \t]*)$/;
+
+function stripYamlComment(raw) {
+  let quote = null;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (quote === '"') {
+      if (c === "\\" && i + 1 < raw.length) i += 1;
+      else if (c === '"') quote = null;
+      continue;
+    }
+    if (quote === "'") {
+      if (c === "'" && raw[i + 1] === "'") i += 1;
+      else if (c === "'") quote = null;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      quote = c;
+      continue;
+    }
+    if (c === "#" && (i === 0 || raw[i - 1] === " " || raw[i - 1] === "\t")) {
+      return raw.slice(0, i).trimEnd();
+    }
+  }
+  return raw.trimEnd();
+}
+
+function unquoteYaml(raw) {
+  if (raw.length >= 2 && raw[0] === '"' && raw[raw.length - 1] === '"') {
+    return raw.slice(1, -1).replace(/\\([\\"ntr])/g, (_, ch) => {
+      if (ch === "n") return "\n";
+      if (ch === "t") return "\t";
+      if (ch === "r") return "\r";
+      return ch;
+    });
+  }
+  if (raw.length >= 2 && raw[0] === "'" && raw[raw.length - 1] === "'") {
+    return raw.slice(1, -1).replace(/''/g, "'");
+  }
+  return raw;
+}
+
+function parseFlowSequence(raw) {
+  const inner = raw.slice(1, -1).trim();
+  if (!inner) return [];
+  const items = [];
+  let start = 0;
+  let quote = null;
+  let depth = 0;
+
+  for (let i = 0; i < inner.length; i++) {
+    const c = inner[i];
+    if (quote === '"') {
+      if (c === "\\" && i + 1 < inner.length) i += 1;
+      else if (c === '"') quote = null;
+      continue;
+    }
+    if (quote === "'") {
+      if (c === "'" && inner[i + 1] === "'") i += 1;
+      else if (c === "'") quote = null;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      quote = c;
+      continue;
+    }
+    if (c === "[" || c === "{") {
+      depth += 1;
+    } else if (c === "]" || c === "}") {
+      if (depth === 0) return null;
+      depth -= 1;
+    } else if (c === "," && depth === 0) {
+      items.push(unquoteYaml(inner.slice(start, i).trim()));
+      start = i + 1;
+    }
+  }
+  if (quote !== null || depth !== 0) return null;
+
+  const tail = inner.slice(start).trim();
+  if (tail) items.push(unquoteYaml(tail));
+  return items;
+}
+
+function indentOf(line) {
+  let n = 0;
+  while (n < line.length && line[n] === " ") n += 1;
+  return n;
+}
+
+function dedentLines(lines, explicitIndent = 0) {
+  let min = explicitIndent;
+  if (min <= 0) {
+    min = Infinity;
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      min = Math.min(min, indentOf(line));
+    }
+    if (!Number.isFinite(min)) min = 0;
+  }
+  return lines.map((line) => (line.trim() ? line.slice(Math.min(min, indentOf(line))) : ""));
+}
+
+function parseBlockScalar(lines, style, chomp, explicitIndent) {
+  const dedented = dedentLines(lines, explicitIndent);
+  if (chomp !== "+") {
+    while (dedented.length && !dedented[dedented.length - 1].trim()) {
+      dedented.pop();
+    }
+  }
+  if (style === "|") return dedented.join("\n");
+
+  // Folded scalar (`>`): join adjacent non-indented text lines with spaces
+  // while keeping blank lines and more-indented lines as line breaks.
+  const out = [];
+  let paragraph = [];
+  const flushParagraph = () => {
+    if (!paragraph.length) return;
+    out.push(paragraph.join(" "));
+    paragraph = [];
+  };
+  for (const line of dedented) {
+    if (!line.trim()) {
+      flushParagraph();
+      out.push("");
+    } else if (/^[ \t]/.test(line)) {
+      flushParagraph();
+      out.push(line);
+    } else {
+      paragraph.push(line);
+    }
+  }
+  flushParagraph();
+  return out.join("\n");
+}
+
+function parsePlainMultiline(first, continuation) {
+  const paragraphs = [];
+  let current = [first];
+  for (const line of continuation) {
+    const cleaned = stripYamlComment(line).trim();
+    if (!cleaned) {
+      if (current.length) {
+        paragraphs.push(current.join(" "));
+        current = [];
+      }
+    } else {
+      current.push(cleaned);
+    }
+  }
+  if (current.length) paragraphs.push(current.join(" "));
+  return paragraphs.join("\n");
+}
+
+function nextContentIndex(body, from) {
+  let i = from;
+  while (i < body.length && YAML_BLANK_OR_COMMENT.test(body[i])) i += 1;
+  return i;
+}
+
+function readBlockScalar(body, start, blockMatch) {
+  const style = blockMatch[1];
+  const mod = blockMatch[2] ?? "";
+  const chomp = mod.includes("-") ? "-" : mod.includes("+") ? "+" : "";
+  const explicitIndent = Number(mod.replace(/[+-]/g, "")) || 0;
+  const lines = [];
+  let i = start;
+  while (i < body.length && (!body[i].trim() || /^[ \t]/.test(body[i]))) {
+    lines.push(body[i]);
+    i += 1;
+  }
+  return {
+    value: parseBlockScalar(lines, style, chomp, explicitIndent),
+    nextIndex: i,
+  };
+}
+
+function readPlainContinuation(body, start, inline) {
+  const cont = [];
+  let i = start;
+  while (i < body.length) {
+    if (/^[ \t]+\S/.test(body[i])) {
+      cont.push(body[i]);
+      i += 1;
+      continue;
+    }
+    if (!body[i].trim()) {
+      const next = nextContentIndex(body, i + 1);
+      if (next < body.length && /^[ \t]+\S/.test(body[next])) {
+        cont.push("");
+        i += 1;
+        continue;
+      }
+    }
+    break;
+  }
+  const first = unquoteYaml(inline);
+  return {
+    value: cont.length ? parsePlainMultiline(first, cont) : first,
+    nextIndex: i,
+  };
+}
+
+function readBlockSequence(body, start, seqIndent) {
+  const items = [];
+  let i = start;
+  while (i < body.length) {
+    if (YAML_BLANK_OR_COMMENT.test(body[i])) {
+      i += 1;
+      continue;
+    }
+    const itemMatch = YAML_SEQ_ITEM.exec(body[i]);
+    if (!itemMatch || itemMatch[1].length !== seqIndent) break;
+    const first = unquoteYaml(stripYamlComment(itemMatch[2] ?? "").trim());
+    i += 1;
+    const itemCont = [];
+    while (i < body.length && indentOf(body[i]) > seqIndent && body[i].trim()) {
+      const cleaned = stripYamlComment(body[i]).trim();
+      if (cleaned) itemCont.push(cleaned);
+      i += 1;
+    }
+    const parts = itemCont.length ? [first, ...itemCont].filter(Boolean) : null;
+    items.push(parts ? parts.join(" ") : first);
+  }
+  return { value: items, nextIndex: i };
+}
+
+function readNestedBlock(body, start) {
+  const nested = [];
+  let i = start;
+  while (i < body.length) {
+    if (!body[i].trim()) {
+      const after = nextContentIndex(body, i + 1);
+      if (after < body.length && /^[ \t]/.test(body[after])) {
+        nested.push("");
+        i += 1;
+        continue;
+      }
+      break;
+    }
+    if (!/^[ \t]/.test(body[i])) break;
+    if (!/^[ \t]*#/.test(body[i])) nested.push(body[i]);
+    i += 1;
+  }
+  return { value: dedentLines(nested).join("\n").trimEnd(), nextIndex: i };
+}
+
+// Parses leading `--- ... ---` YAML frontmatter from an array of `\r`-stripped
+// lines. Returns `{ endLine, entries }` (with 1-based inclusive `endLine`), or
+// null when the document does not start with valid YAML frontmatter.
+function parseFrontmatterLines(lines) {
+  if (!lines.length || !/^\uFEFF?---[ \t]*$/.test(lines[0])) return null;
+  let close = -1;
+  for (let i = 1; i < lines.length; i++) {
+    if (/^(?:---|\.\.\.)[ \t]*$/.test(lines[i])) {
+      close = i;
+      break;
+    }
+  }
+  if (close < 0) return null;
+
+  const body = lines.slice(1, close);
+  const entries = [];
+  let i = 0;
+
+  while (i < body.length) {
+    if (YAML_BLANK_OR_COMMENT.test(body[i])) {
+      i += 1;
+      continue;
+    }
+    if (/^[ \t]/.test(body[i])) return null;
+
+    const match = YAML_KEY.exec(body[i]);
+    if (!match) return null;
+
+    const key = unquoteYaml(match[1].trim());
+    const rawRest = match[2] ?? "";
+    i += 1;
+
+    const blockMatch = YAML_BLOCK_SCALAR.exec(rawRest.trim());
+    if (blockMatch) {
+      const scalar = readBlockScalar(body, i, blockMatch);
+      entries.push({ key, value: scalar.value });
+      i = scalar.nextIndex;
+      continue;
+    }
+
+    const inline = stripYamlComment(rawRest).trim();
+    if (inline) {
+      if (inline.startsWith("[") && inline.endsWith("]")) {
+        const seq = parseFlowSequence(inline);
+        if (seq !== null) {
+          entries.push({ key, value: seq });
+          continue;
+        }
+      }
+      const plain = readPlainContinuation(body, i, inline);
+      entries.push({ key, value: plain.value });
+      i = plain.nextIndex;
+      continue;
+    }
+
+    // Empty inline value: check for a block sequence or nested mapping below.
+    const next = nextContentIndex(body, i);
+    if (next >= body.length) {
+      entries.push({ key, value: "" });
+      i = next;
+      continue;
+    }
+
+    const seqMatch = YAML_SEQ_ITEM.exec(body[next]);
+    if (seqMatch) {
+      const seq = readBlockSequence(body, next, seqMatch[1].length);
+      entries.push({ key, value: seq.value });
+      i = seq.nextIndex;
+      continue;
+    }
+
+    if (/^[ \t]/.test(body[next])) {
+      const nested = readNestedBlock(body, next);
+      entries.push({ key, value: nested.value });
+      i = nested.nextIndex;
+      continue;
+    }
+
+    entries.push({ key, value: "" });
+  }
+
+  if (!entries.length) return null;
+  return { endLine: close + 1, entries };
+}
+
+// Parses leading YAML frontmatter from a markdown string.
+// Returns `{ entries, from, to, body }` or null when absent/invalid.
+export function parseFrontmatter(text) {
+  if (!text) return null;
+  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+  const fm = parseFrontmatterLines(lines);
+  if (!fm) return null;
+  return {
+    entries: fm.entries,
+    from: 1,
+    to: fm.endLine,
+    body: lines.slice(fm.endLine).join("\n"),
+  };
+}
+
 // Splits a markdown file into clickable visual blocks: [{ kind, from, to, text }]
-// with 1-based inclusive line numbers. Mermaid blocks (`kind: "mermaid"`) carry
-// `code` without fences. When `where` is given (see liftPictures), blocks that
-// reference local pictures also carry `pictures` and `shown`.
+// with 1-based inclusive line numbers. Leading YAML frontmatter (`kind: "frontmatter"`)
+// carries parsed `entries`. Mermaid blocks (`kind: "mermaid"`) carry `code` without
+// fences. When `where` is given (see liftPictures), blocks that reference local
+// pictures also carry `pictures` and `shown`.
 export function markdownBlocks(text, where) {
   const src = text
     .replace(/\n$/, "")
@@ -514,7 +867,20 @@ export function markdownBlocks(text, where) {
   };
   const indented = (line) => /^(\t| {2,})\S/.test(line);
 
-  for (let i = 0; i < src.length; i++) {
+  let startLine = 0;
+  const fm = parseFrontmatterLines(src);
+  if (fm) {
+    out.push({
+      kind: "frontmatter",
+      from: 1,
+      to: fm.endLine,
+      text: src.slice(0, fm.endLine).join("\n"),
+      entries: fm.entries,
+    });
+    startLine = fm.endLine;
+  }
+
+  for (let i = startLine; i < src.length; i++) {
     const line = src[i];
     if (cur?.type === "fence") {
       cur.lines.push(line);
@@ -1101,10 +1467,10 @@ export function liftPictures(text, where) {
   return { text: out.join("\n"), pictures: held };
 }
 
-// Splits a markdown document into ordered `"md"`, `"pictures"`, and `"mermaid"`
-// segments for `doc.js`, stripping opening fence languages on markdown fences
-// while preserving inner example fences and 4-space indented code blocks.
-// `where(src)`: see `liftPictures`.
+// Splits a markdown document into ordered `"frontmatter"` (with parsed `entries`),
+// `"md"`, `"pictures"`, and `"mermaid"` segments for `doc.js`, stripping opening
+// fence languages on markdown fences while preserving inner example fences and
+// 4-space indented code blocks. `where(src)`: see `liftPictures`.
 export function splitMarkdown(text, where) {
   const out = [];
   const step = createFenceScanner();
@@ -1130,7 +1496,20 @@ export function splitMarkdown(text, where) {
   };
   const diagram = (code, open) => out.push({ kind: "mermaid", code, open });
 
-  for (const line of text.replace(/\r\n?/g, "\n").split("\n")) {
+  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+  let startLine = 0;
+  const fm = parseFrontmatterLines(lines);
+  if (fm) {
+    out.push({
+      kind: "frontmatter",
+      entries: fm.entries,
+      id: textKey(lines.slice(0, fm.endLine).join("\n")),
+    });
+    startLine = fm.endLine;
+  }
+
+  for (let i = startLine; i < lines.length; i++) {
+    const line = lines[i];
     const r = step(line);
     if (mermaidBody !== null) {
       if (r.kind === "inside") {

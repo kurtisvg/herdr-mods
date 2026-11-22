@@ -10,6 +10,119 @@ import { CACHE } from "./pictures.js";
 const PAGE = 920; // maximum text-column width in pixels
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+function renderFrontmatterValue(value, t) {
+  const isEmpty = Array.isArray(value) ? value.length === 0 : !value;
+  if (isEmpty) {
+    return div().flex_1().min_w(0).text_color(t.dim).child("—");
+  }
+  if (!Array.isArray(value)) {
+    return div().flex_1().min_w(0).text_color(t.foreground).child(value);
+  }
+  return h_flex()
+    .flex_1()
+    .min_w(0)
+    .flex_wrap()
+    .gap(4)
+    .children(
+      value.map((item) =>
+        div()
+          .px(6)
+          .py(1)
+          .rounded(4)
+          .border_1()
+          .border_color(t.border)
+          .bg(t.background)
+          .text_size(11)
+          .text_color(t.foreground)
+          .child(item),
+      ),
+    );
+}
+
+function frontmatterRows(entries, t) {
+  return v_flex()
+    .w_full()
+    .px(10)
+    .py(6)
+    .gap(4)
+    .border_t(1)
+    .border_color(t.border)
+    .children(
+      entries.map((entry) =>
+        h_flex()
+          .w_full()
+          .items_start()
+          .gap(10)
+          .text_size(12)
+          .child(
+            div()
+              .w(104)
+              .flex_none()
+              .truncate()
+              .font_medium()
+              .text_color(t.muted)
+              .child(entry.key),
+          )
+          .child(renderFrontmatterValue(entry.value, t)),
+      ),
+    );
+}
+
+// Collapsible key/value metadata card for leading YAML frontmatter.
+// Used by both `MarkdownDoc` (`doc.js`) and `Panel` (`panel.js`).
+export function frontmatterCard(id, entries, open, onToggle, t) {
+  const count = entries.length === 1 ? "1 field" : `${entries.length} fields`;
+  const middle = open
+    ? div().flex_1()
+    : div()
+        .flex_1()
+        .min_w(0)
+        .truncate()
+        .text_size(11)
+        .text_color(t.dim)
+        .child(entries.map((e) => e.key).join(", "));
+
+  const header = h_flex()
+    .id(id)
+    .w_full()
+    .px(10)
+    .py(6)
+    .gap(6)
+    .items_center()
+    .cursor_pointer()
+    .hover((s) => s.bg(t.hover))
+    .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+    .on_click((_e, cx) => onToggle(cx))
+    .child(
+      div()
+        .w(10)
+        .flex_none()
+        .text_size(11)
+        .text_color(t.dim)
+        .child(open ? "▾" : "▸"),
+    )
+    .child(
+      div()
+        .flex_none()
+        .font_medium()
+        .text_size(11.5)
+        .text_color(t.muted)
+        .child("Frontmatter"),
+    )
+    .child(middle)
+    .child(div().flex_none().text_size(11).text_color(t.dim).child(count));
+
+  return v_flex()
+    .w_full()
+    .rounded(8)
+    .border_1()
+    .border_color(t.border)
+    .bg(t.surface)
+    .overflow_hidden()
+    .child(header)
+    .when(open, (el) => el.child(frontmatterRows(entries, t)));
+}
+
 export class MarkdownDoc {
   constructor(name, pictures, diagrams, file = null, on = null) {
     this.name = name;
@@ -20,6 +133,7 @@ export class MarkdownDoc {
     this.on = on;
     this.text = null;
     this.segments = [];
+    this.frontmatterOpen = true;
   }
 
   // Updates the document text and theme. Returns true when segments changed.
@@ -194,6 +308,18 @@ export class MarkdownDoc {
           .text_size(14)
           .children(
             this.segments.map((s, i) => {
+              if (s.kind === "frontmatter") {
+                return frontmatterCard(
+                  `${this.name}-frontmatter-${i}`,
+                  s.entries,
+                  this.frontmatterOpen,
+                  (cx) => {
+                    this.frontmatterOpen = !this.frontmatterOpen;
+                    cx.notify();
+                  },
+                  t,
+                );
+              }
               if (s.kind === "md") {
                 return div()
                   .w_full()

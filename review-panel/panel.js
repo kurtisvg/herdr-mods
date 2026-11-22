@@ -86,6 +86,7 @@ import {
   machineOf,
 } from "./model.js";
 import { Diagrams } from "./diagrams.js";
+import { frontmatterCard } from "./doc.js";
 import { Pictures, CACHE as PICTURES } from "./pictures.js";
 
 const MODES = ["files", "changes", "comments"];
@@ -330,6 +331,7 @@ export class Panel {
     this.raw = localStorage.getItem("raw") === "1";
     this.mdMode = "rendered"; // "rendered" | "edit" | "comment" in Files
     this.blocks = null;
+    this.frontmatterOpen = true;
     this.anchorBlock = null;
     this.headBlock = null;
     this.hoveredBlock = null;
@@ -1303,6 +1305,7 @@ export class Panel {
     this.revealRow = null;
     this.revealBlock = null;
     this.blocks = null;
+    this.frontmatterOpen = true;
     this.anchorBlock = null;
     this.headBlock = null;
     this.hoveredBlock = null;
@@ -2506,21 +2509,35 @@ export class Panel {
       };
       const picture =
         b.kind === "mermaid" ? this.diagrams.get(b.code) : undefined;
-      const scale = picture?.path ? Math.min(1, room / picture.width) : 1;
-      const body = picture?.path
-        ? [
-            image(picture.path)
-              .w(Math.round(picture.width * scale))
-              .h(Math.round(picture.height * scale))
-              .flex_none(),
-          ]
-        : picture?.pending
-          ? [note("Drawing diagram…"), text()]
-          : picture?.error
-            ? [text(), note(`Diagram not drawn: ${picture.error}`)]
-            : rawShown.trim()
-              ? [text()]
-              : [];
+      const body = [];
+      if (b.kind === "frontmatter") {
+        body.push(
+          frontmatterCard(
+            `review-frontmatter-${i}`,
+            b.entries,
+            this.frontmatterOpen,
+            (cx) => {
+              this.frontmatterOpen = !this.frontmatterOpen;
+              cx.notify();
+            },
+            t,
+          ),
+        );
+      } else if (picture?.path) {
+        const scale = Math.min(1, room / picture.width);
+        body.push(
+          image(picture.path)
+            .w(Math.round(picture.width * scale))
+            .h(Math.round(picture.height * scale))
+            .flex_none(),
+        );
+      } else if (picture?.pending) {
+        body.push(note("Drawing diagram…"), text());
+      } else if (picture?.error) {
+        body.push(text(), note(`Diagram not drawn: ${picture.error}`));
+      } else if (rawShown.trim()) {
+        body.push(text());
+      }
       if (b.pictures) {
         body.push(
           h_flex()

@@ -29,6 +29,7 @@ import {
   adoptable,
   attach,
   isMarkdown,
+  parseFrontmatter,
   markdownBlocks,
   bareFences,
   blockFor,
@@ -1654,4 +1655,156 @@ test("shouldCopyQuote yields to editor, rendered markdown TextView, and non-empt
   assert.equal(shouldCopyQuote({ ...base, hasQuote: false }), false);
   assert.equal(shouldCopyQuote({ ...base, mod: false }), false);
   assert.equal(shouldCopyQuote({ ...base, key: "v" }), false);
+});
+
+test("parseFrontmatter parses scalars, lists, multiline values, and nested mappings", () => {
+  const cases = [
+    {
+      name: "scalars, quotes, comments, and empty value",
+      yaml: [
+        "# leading comment",
+        'title: "Hello: #not-a-comment"',
+        "subtitle: 'It''s a card'",
+        "url: https://example.com/docs#intro # trailing comment",
+        "empty:",
+      ],
+      entries: [
+        { key: "title", value: "Hello: #not-a-comment" },
+        { key: "subtitle", value: "It's a card" },
+        { key: "url", value: "https://example.com/docs#intro" },
+        { key: "empty", value: "" },
+      ],
+    },
+    {
+      name: "flow and block sequences",
+      yaml: [
+        "tags: [markdown, \"ui, card\", 'herdr']",
+        "blank_list: []",
+        "authors:",
+        "  - Ada Lovelace",
+        "  - Grace",
+        "    Hopper",
+        "aliases:",
+        "- zero-indent",
+      ],
+      entries: [
+        { key: "tags", value: ["markdown", "ui, card", "herdr"] },
+        { key: "blank_list", value: [] },
+        { key: "authors", value: ["Ada Lovelace", "Grace Hopper"] },
+        { key: "aliases", value: ["zero-indent"] },
+      ],
+    },
+    {
+      name: "plain multiline and block scalars",
+      yaml: [
+        "description: First line of",
+        "  plain multiline text.",
+        "",
+        "  Second paragraph.",
+        "notes: |",
+        "  line one",
+        "  line two",
+        "summary: >-",
+        "  folded across",
+        "  two lines",
+      ],
+      entries: [
+        { key: "description", value: "First line of plain multiline text.\nSecond paragraph." },
+        { key: "notes", value: "line one\nline two" },
+        { key: "summary", value: "folded across two lines" },
+      ],
+    },
+    {
+      name: "nested mapping",
+      yaml: [
+        "meta:",
+        "  owner: team",
+        "  review: required",
+      ],
+      entries: [{ key: "meta", value: "owner: team\nreview: required" }],
+    },
+  ];
+
+  for (const tc of cases) {
+    const doc = ["---", ...tc.yaml, "---", "", "# Heading"].join("\n");
+    const fm = parseFrontmatter(doc);
+    assert.ok(fm, tc.name);
+    assert.equal(fm.from, 1, tc.name);
+    assert.equal(fm.to, tc.yaml.length + 2, tc.name);
+    assert.equal(fm.body, "\n# Heading", tc.name);
+    assert.deepEqual(fm.entries, tc.entries, tc.name);
+  }
+});
+
+test("parseFrontmatter handles BOM, CRLF line endings, and ... closing delimiter", () => {
+  const crlf = "\uFEFF---\r\ntitle: Hello\r\n---\r\nBody";
+  assert.deepEqual(parseFrontmatter(crlf), {
+    entries: [{ key: "title", value: "Hello" }],
+    from: 1,
+    to: 3,
+    body: "Body",
+  });
+
+  const dotClose = "---\nname: skill\n...\nBody";
+  assert.deepEqual(parseFrontmatter(dotClose), {
+    entries: [{ key: "name", value: "skill" }],
+    from: 1,
+    to: 3,
+    body: "Body",
+  });
+});
+
+test("parseFrontmatter rejects absent, unclosed, empty, or non-YAML blocks", () => {
+  for (const input of [
+    "",
+    "# Heading\n---\ntitle: Hi\n---",
+    "\n---\ntitle: Hi\n---",
+    "----\ntitle: Hi\n----",
+    "---\ntitle: Unclosed",
+    "---\n---",
+    "---\n# only a comment\n---",
+    "---\nJust a prose paragraph\n---",
+    "---\n  indented: orphan\n---",
+  ]) {
+    assert.equal(parseFrontmatter(input), null, `expected null for: ${JSON.stringify(input)}`);
+  }
+});
+
+test("markdownBlocks and splitMarkdown emit frontmatter without shifting later line numbers", () => {
+  const doc = [
+    "---",
+    "name: review-panel",
+    "tags: [herdr, markdown]",
+    "---",
+    "",
+    "# Title",
+    "",
+    "Body paragraph.",
+  ].join("\n");
+
+  const blocks = markdownBlocks(doc + "\n");
+  assert.deepEqual(
+    blocks.map((b) => `${b.kind} ${b.from}-${b.to}`),
+    ["frontmatter 1-4", "md 6-6", "md 8-8"],
+  );
+  assert.deepEqual(blocks[0].entries, [
+    { key: "name", value: "review-panel" },
+    { key: "tags", value: ["herdr", "markdown"] },
+  ]);
+  assert.equal(blockFor(blocks, 2), 0);
+  assert.equal(blockFor(blocks, 6), 1);
+
+  const segs = splitMarkdown(doc, () => null);
+  assert.deepEqual(
+    segs.map((s) => s.kind),
+    ["frontmatter", "md"],
+  );
+  assert.deepEqual(segs[0].entries, blocks[0].entries);
+  assert.equal(segs[1].text.trim(), "# Title\n\nBody paragraph.");
+
+  const onlyFm = splitMarkdown("---\ntitle: Solo\n---\n", () => null);
+  assert.deepEqual(
+    onlyFm.map((s) => s.kind),
+    ["frontmatter"],
+  );
 });
