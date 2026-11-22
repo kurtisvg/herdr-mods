@@ -74,6 +74,8 @@ import {
   markdownBlocks,
   bareFences,
   blockFor,
+  nextHoveredBlock,
+  shouldCopyQuote,
   textKey,
   pictureFile,
   resolveLink,
@@ -99,6 +101,8 @@ const PER_FOLDER = 500;
 const TOTAL = 5000;
 const STALE = 10000; // ms before re-reading displayed state
 const SEND_TIMEOUT = 120000; // `hc send` waits up to a minute for partial input
+const MD_GUTTER_INSET = 32; // left padding (6) + '+' gutter (20) + gap (6)
+const MD_HORIZONTAL_CHROME = MD_GUTTER_INSET + 18; // left inset + right padding + scrollbar
 
 const READ = [
   "--no-optional-locks",
@@ -328,6 +332,7 @@ export class Panel {
     this.blocks = null;
     this.anchorBlock = null;
     this.headBlock = null;
+    this.hoveredBlock = null;
     this.editor = null;
     this.editorRoot = null;
     this.editorPath = null;
@@ -1300,6 +1305,7 @@ export class Panel {
     this.blocks = null;
     this.anchorBlock = null;
     this.headBlock = null;
+    this.hoveredBlock = null;
     if (this.pick && !this.hasText) this.cancel();
     this.commenting = false;
     this.mdMode = "rendered";
@@ -1416,6 +1422,7 @@ export class Panel {
       this.head = null;
       this.anchorBlock = null;
       this.headBlock = null;
+      this.hoveredBlock = null;
       this.start = 0;
       this.ready = false;
       this.jump = "top";
@@ -1491,6 +1498,7 @@ export class Panel {
       this.flushSave(cx);
     }
     this.mdMode = mode;
+    this.hoveredBlock = null;
     if (mode === "edit") {
       this.blocks = null;
       this.cancel();
@@ -1634,6 +1642,7 @@ export class Panel {
     this.head = null;
     this.anchorBlock = null;
     this.headBlock = null;
+    this.hoveredBlock = null;
     this.dragging = false;
     if (this.start >= rows.length) this.start = 0;
   }
@@ -1696,6 +1705,13 @@ export class Panel {
     cx.notify();
   }
 
+  hoverBlock(i, over, cx) {
+    const next = nextHoveredBlock(this.hoveredBlock, i, over);
+    if (next === this.hoveredBlock) return;
+    this.hoveredBlock = next;
+    cx.notify();
+  }
+
   spanBlocks(i) {
     const a = this.blocks[this.anchorBlock];
     const b = this.blocks[i];
@@ -1735,6 +1751,7 @@ export class Panel {
     this.head = null;
     this.anchorBlock = null;
     this.headBlock = null;
+    this.hoveredBlock = null;
     this.dragging = false;
     this.copied = false;
     this.draft.set_value("");
@@ -2294,7 +2311,7 @@ export class Panel {
       .id(`c-${c.id}`)
       .flex_none()
       .w(width)
-      .ml(this.blocks ? 16 : 44)
+      .ml(this.blocks ? MD_GUTTER_INSET : 44)
       .my(4)
       .p(8)
       .gap(4)
@@ -2409,7 +2426,10 @@ export class Panel {
       this.anchor === null ? -1 : Math.min(this.anchor, this.head) + 1;
     const hi =
       this.anchor === null ? -1 : Math.max(this.anchor, this.head) + 1;
-    const room = Math.max(120, (this.size?.width ?? 360) - 34);
+    const room = Math.max(
+      120,
+      (this.size?.width ?? 360) - MD_HORIZONTAL_CHROME,
+    );
     const push = (c, flag) => {
       out.push(this.commentBox(c, t, boxWidth, flag));
       if (this.reveal === c.id) {
@@ -2437,6 +2457,7 @@ export class Panel {
           this.head = null;
           this.anchorBlock = null;
           this.headBlock = null;
+          this.hoveredBlock = null;
           this.jump = "top";
           cx.notify();
         })
@@ -2479,7 +2500,9 @@ export class Panel {
         return TextView.markdown(
           `review-md-${i}-${textKey(shownText)}`,
           shownText,
-        ).on_link_click(link);
+        )
+          .selectable(true)
+          .on_link_click(link);
       };
       const picture =
         b.kind === "mermaid" ? this.diagrams.get(b.code) : undefined;
@@ -2528,21 +2551,46 @@ export class Panel {
             ),
         );
       }
+      const showGutter = this.hoveredBlock === i || picked;
+      const gutter = h_flex()
+        .id(`block-add-${i}`)
+        .w(20)
+        .h(20)
+        .mt(1)
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .rounded(4)
+        .text_size(12)
+        .cursor_pointer()
+        .text_color(picked ? t.accent : t.dim)
+        .when(showGutter, (e) =>
+          e
+            .hover((s) => s.bg(t.hover).text_color(t.foreground))
+            .child("+"),
+        )
+        .on_mouse_down("left", (e, cx) => this.pressBlock(i, e, cx));
+      const content = v_flex()
+        .flex_1()
+        .min_w(0)
+        .gap(4)
+        .text_size(13)
+        .children(body);
       out.push(
-        v_flex()
+        h_flex()
           .id(`block-${i}`)
           .w_full()
           .flex_none()
-          .gap(4)
+          .items_start()
+          .gap(6)
           .py(3)
-          .px(16)
-          .text_size(13)
-          .cursor_pointer()
+          .pl(6)
+          .pr(16)
           .when(picked, (e) => e.bg(t.selected))
-          .when(!picked, (e) => e.hover((s) => s.bg(t.hover)))
-          .on_mouse_down("left", (e, cx) => this.pressBlock(i, e, cx))
+          .on_hover((over, cx) => this.hoverBlock(i, over, cx))
           .on_mouse_move((_e, cx) => this.dragBlock(i, cx))
-          .children(body),
+          .child(gutter)
+          .child(content),
       );
       if (this.revealBlock === i) {
         this.scroll.scroll_to_item(out.length - 1);
@@ -3118,6 +3166,26 @@ export class Panel {
             ),
         ),
       )
+      .when(Boolean(writing?.quote?.length), (e) =>
+        e.child(
+          div()
+            .id("draft-copy")
+            .h(26)
+            .px(8)
+            .flex_none()
+            .flex()
+            .items_center()
+            .rounded(7)
+            .border_1()
+            .border_color(t.border)
+            .text_size(11.5)
+            .cursor_pointer()
+            .text_color(this.copied ? t.ansi2 : t.muted)
+            .hover((s) => s.text_color(t.foreground))
+            .on_click((_e, cx) => this.copyQuote(writing.quote, cx))
+            .child(this.copied ? "Copied" : "Copy"),
+        ),
+      )
       .when(openChangesMd, (e) =>
         e.child(
           h_flex()
@@ -3223,8 +3291,9 @@ export class Panel {
       })
       .on_mouse_up("left", (_e, cx) => this.release(cx))
       .on_hover((over, cx) => {
-        if (!over && this.dragging) {
+        if (!over && (this.dragging || this.hoveredBlock !== null)) {
           this.dragging = false;
+          this.hoveredBlock = null;
           cx.notify();
         }
       })
@@ -3236,7 +3305,16 @@ export class Panel {
           this.flushSave(cx);
           return;
         }
-        if (mod && key === "c" && !inEditor && writing?.quote?.length && !this.hasText) {
+        if (
+          shouldCopyQuote({
+            mod,
+            key,
+            inEditor,
+            inMarkdownPreview: Boolean(this.blocks),
+            hasQuote: Boolean(writing?.quote?.length),
+            hasDraftText: this.hasText,
+          })
+        ) {
           cx.stop_propagation();
           this.copyQuote(writing.quote, cx);
           return;
@@ -3341,7 +3419,10 @@ export class Panel {
         ),
       )
       .when(Boolean(this.open) && !inEditor, (e) => {
-        const drawnBoxW = Math.max(180, (this.size?.width ?? 360) - 34);
+        const drawnBoxW = Math.max(
+          180,
+          (this.size?.width ?? 360) - MD_HORIZONTAL_CHROME,
+        );
         const codeBoxW = Math.max(
           180,
           (this.size?.width ?? 360) - CODE_GUTTER_WIDTH,
@@ -3380,7 +3461,9 @@ export class Panel {
             : "Comment on";
         const draftHint = this.replying
           ? "Goes out with the next review"
-          : "Cmd-Enter adds it · Copy or Cmd-C copies lines";
+          : this.blocks
+            ? "Cmd-Enter adds it · Copy copies lines"
+            : "Cmd-Enter adds it · Copy or Cmd-C copies lines";
         const saveLabel = this.editing
           ? "Save"
           : this.replying
@@ -3405,18 +3488,6 @@ export class Panel {
                     .min_w(0)
                     .truncate()
                     .child(`${draftHeading} ${where(writing)}`),
-                )
-                .when(Boolean(writing.quote?.length), (e) =>
-                  e.child(
-                    div()
-                      .id("draft-copy")
-                      .flex_none()
-                      .cursor_pointer()
-                      .text_color(this.copied ? t.ansi2 : t.muted)
-                      .hover((s) => s.text_color(t.foreground))
-                      .on_click((_e, cx) => this.copyQuote(writing.quote, cx))
-                      .child(this.copied ? "Copied" : "Copy"),
-                  ),
                 )
                 .child(
                   div()

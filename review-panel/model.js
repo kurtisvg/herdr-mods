@@ -795,6 +795,35 @@ export function blockFor(blocks, line) {
   return before;
 }
 
+// Next hovered markdown block index after a hover enter/leave event on `index`.
+// Ignoring a stale leave for another block prevents out-of-order hover events
+// from clearing the newly hovered block.
+export function nextHoveredBlock(current, index, over) {
+  if (over) return index;
+  return current === index ? null : current;
+}
+
+// Whether Cmd/Ctrl+C should copy the selected review quote instead of letting
+// native text selection (editor, markdown TextView, or non-empty draft) handle
+// it.
+export function shouldCopyQuote({
+  mod,
+  key,
+  inEditor,
+  inMarkdownPreview,
+  hasQuote,
+  hasDraftText,
+}) {
+  return (
+    Boolean(mod) &&
+    key === "c" &&
+    !inEditor &&
+    !inMarkdownPreview &&
+    Boolean(hasQuote) &&
+    !hasDraftText
+  );
+}
+
 // ---------------------------------------------------------------- pictures and viewer segments
 
 function normalizePath(path) {
