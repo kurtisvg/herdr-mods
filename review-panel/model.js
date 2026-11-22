@@ -151,6 +151,24 @@ export function editorLines(text, start, end, rowCount) {
   return { anchor: Math.min(anchor, last), head: Math.min(head, last) };
 }
 
+// Maps a 1-based inclusive line range [from, to] to UTF-16 offsets
+// { start, end } in `text`, excluding the trailing line ending of line `to`.
+export function lineRangeOffsets(text, from, to = from) {
+  if (!text) return { start: 0, end: 0 };
+  const limit = text.endsWith("\n") ? text.length - 1 : text.length;
+  const lineStarts = [0];
+  for (let i = 0; i < limit; i++) {
+    if (text[i] === "\n") lineStarts.push(i + 1);
+  }
+  const count = lineStarts.length;
+  const lo = Math.max(1, Math.min(Math.min(from, to), count));
+  const hi = Math.max(lo, Math.min(Math.max(from, to), count));
+  const start = lineStarts[lo - 1];
+  let end = hi < count ? lineStarts[hi] - 1 : limit;
+  if (end > start && text[end - 1] === "\r") end -= 1;
+  return { start, end };
+}
+
 // Index of the row a comment hangs under (its last line), or -1 when absent.
 export function locate(c, rows) {
   for (let i = rows.length - 1; i >= 0; i--) {
@@ -864,6 +882,82 @@ export function pictureFile(src, dir) {
     s = `${dir}/${s}`;
   }
   return normalizePath(s);
+}
+
+// Parses a `#L42` or `#L42-L50` (or `#L42-50`) line anchor fragment into a
+// 1-based inclusive `{ from, to }` range, or null for any other fragment.
+export function parseLineAnchor(fragment) {
+  if (!fragment) return null;
+  const raw = fragment.startsWith("#") ? fragment.slice(1) : fragment;
+  const match = /^L(\d+)(?:-L?(\d+))?$/i.exec(raw);
+  if (!match) return null;
+  const a = Number(match[1]);
+  const b = match[2] ? Number(match[2]) : a;
+  if (!Number.isSafeInteger(a) || !Number.isSafeInteger(b) || a < 1 || b < 1) {
+    return null;
+  }
+  return { from: Math.min(a, b), to: Math.max(a, b) };
+}
+
+// Resolves a markdown link URL against `currentFile` (an absolute path).
+// When `root` is provided, rejects paths outside `root` and returns a
+// repo-relative `path`; otherwise returns an absolute `path`. Returns null for
+// web/custom schemes, directories, or non-line same-file fragments.
+export function resolveLink(url, currentFile, root = null) {
+  if (!url || !currentFile) return null;
+  const raw = url.trim();
+  if (!raw) return null;
+
+  const hashAt = raw.indexOf("#");
+  const beforeHash = hashAt >= 0 ? raw.slice(0, hashAt) : raw;
+  const fragment = hashAt >= 0 ? raw.slice(hashAt + 1) : "";
+  const lines = parseLineAnchor(fragment);
+
+  const queryAt = beforeHash.indexOf("?");
+  let target = queryAt >= 0 ? beforeHash.slice(0, queryAt) : beforeHash;
+
+  if (!target) {
+    if (!lines) return null;
+    target = currentFile;
+  } else {
+    if (/^file:\/\//i.test(target)) {
+      if (!/^file:\/\/(?:localhost)?\//i.test(target)) return null;
+      target = target.replace(/^file:\/\/(?:localhost)?/i, "");
+    } else if (/^[a-z][a-z0-9+.-]*:/i.test(target) || target.startsWith("//")) {
+      return null;
+    }
+
+    try {
+      target = decodeURIComponent(target);
+    } catch {
+      // Keep literal `%` sequences when not valid percent-encoding.
+    }
+    if (!target || target.endsWith("/")) return null;
+
+    if (!target.startsWith("/")) {
+      const dir = currentFile.includes("/")
+        ? currentFile.replace(/\/[^/]*$/, "")
+        : "";
+      target = `${dir}/${target}`;
+    }
+  }
+
+  const parts = [];
+  for (const part of target.split("/")) {
+    if (part === "..") parts.pop();
+    else if (part && part !== ".") parts.push(part);
+  }
+  if (!parts.length) return null;
+  const abs = "/" + parts.join("/");
+
+  if (!root) return { path: abs, lines };
+
+  const normRoot = root.length > 1 ? root.replace(/\/+$/, "") : root;
+  const prefix = normRoot === "/" ? "/" : `${normRoot}/`;
+  if (!abs.startsWith(prefix)) return null;
+  const rel = abs.slice(prefix.length);
+  if (!rel) return null;
+  return { path: rel, lines };
 }
 
 const DEST = String.raw`<[^>]*>|(?:\\.|[^\s()\\]|\((?:\\.|[^\s()\\])*\))+`;

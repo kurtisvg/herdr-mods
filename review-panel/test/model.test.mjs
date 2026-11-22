@@ -9,6 +9,7 @@ import {
   lines,
   where,
   editorLines,
+  lineRangeOffsets,
   locate,
   outdated,
   sortComments,
@@ -35,6 +36,8 @@ import {
   pictureFile,
   watchDir,
   watchBatchMatches,
+  parseLineAnchor,
+  resolveLink,
   liftPictures,
   splitMarkdown,
   editorLanguage,
@@ -1527,4 +1530,99 @@ test("watchBatchMatches handles files at the filesystem root", () => {
   assert.ok(watchBatchMatches(["/"], "/", ["/README.md"]));
   assert.ok(watchBatchMatches(["/README.md"], "/", ["/README.md"]));
   assert.ok(!watchBatchMatches(["/other.md"], "/", ["/README.md"]));
+});
+
+test("parseLineAnchor parses single lines and ranges and rejects non-line fragments", () => {
+  assert.deepEqual(parseLineAnchor("#L42"), { from: 42, to: 42 });
+  assert.deepEqual(parseLineAnchor("L42"), { from: 42, to: 42 });
+  assert.deepEqual(parseLineAnchor("#l7"), { from: 7, to: 7 });
+  assert.deepEqual(parseLineAnchor("#L42-L50"), { from: 42, to: 50 });
+  assert.deepEqual(parseLineAnchor("#L42-50"), { from: 42, to: 50 });
+  assert.deepEqual(parseLineAnchor("#L50-L42"), { from: 42, to: 50 });
+
+  assert.equal(parseLineAnchor(""), null);
+  assert.equal(parseLineAnchor("#"), null);
+  assert.equal(parseLineAnchor("#heading-name"), null);
+  assert.equal(parseLineAnchor("#L0"), null);
+  assert.equal(parseLineAnchor("#L0-L5"), null);
+  assert.equal(parseLineAnchor("#L42-"), null);
+  assert.equal(parseLineAnchor("#L42x"), null);
+});
+
+test("resolveLink resolves any repo file and optional line anchor", () => {
+  const current = "/repo/docs/guide.md";
+  const root = "/repo";
+
+  assert.deepEqual(resolveLink("../src/app.js#L42-L50", current, root), {
+    path: "src/app.js",
+    lines: { from: 42, to: 50 },
+  });
+  assert.deepEqual(resolveLink("other.md#L10", current, root), {
+    path: "docs/other.md",
+    lines: { from: 10, to: 10 },
+  });
+  assert.deepEqual(resolveLink("other.md#overview", current, root), {
+    path: "docs/other.md",
+    lines: null,
+  });
+  assert.deepEqual(resolveLink("src/a.ts?plain=1#L3", "/repo/README.md", "/repo/"), {
+    path: "src/a.ts",
+    lines: { from: 3, to: 3 },
+  });
+  assert.deepEqual(
+    resolveLink("file:///repo/my%20file.py#L4-L8", current, root),
+    { path: "my file.py", lines: { from: 4, to: 8 } },
+  );
+  assert.deepEqual(resolveLink("bad%ZZ.txt", current, root), {
+    path: "docs/bad%ZZ.txt",
+    lines: null,
+  });
+  assert.deepEqual(resolveLink("#L42", current, root), {
+    path: "docs/guide.md",
+    lines: { from: 42, to: 42 },
+  });
+  // Same-file anchor must not percent-decode literal `%XX` in `currentFile`.
+  assert.deepEqual(resolveLink("#L42", "/repo/100%20done.md", root), {
+    path: "100%20done.md",
+    lines: { from: 42, to: 42 },
+  });
+  // Without a root (standalone viewer), returns normalized absolute path.
+  assert.deepEqual(resolveLink("../src/app.js#L12", current), {
+    path: "/repo/src/app.js",
+    lines: { from: 12, to: 12 },
+  });
+
+  // Rejects external schemes, non-line same-file anchors, directories, and escapes.
+  assert.equal(resolveLink("#heading", current, root), null);
+  assert.equal(resolveLink("https://example.com/a.js#L1", current, root), null);
+  assert.equal(resolveLink("mailto:user@example.com", current, root), null);
+  assert.equal(resolveLink("javascript:alert(1)", current, root), null);
+  assert.equal(resolveLink("//cdn.example.com/a.js", current, root), null);
+  assert.equal(resolveLink("../src/", current, root), null);
+  assert.equal(resolveLink("../../etc/passwd", current, root), null);
+  assert.equal(resolveLink("/repo-other/a.js", current, root), null);
+  assert.equal(resolveLink("file://remotehost/repo/a.js", current, root), null);
+});
+
+test("lineRangeOffsets maps 1-based line ranges to UTF-16 offsets", () => {
+  const text = "alpha\nbeta\ngamma\n";
+  assert.deepEqual(lineRangeOffsets(text, 1, 1), { start: 0, end: 5 });
+  assert.deepEqual(lineRangeOffsets(text, 2, 3), { start: 6, end: 16 });
+  assert.deepEqual(lineRangeOffsets(text, 3, 2), { start: 6, end: 16 });
+  assert.deepEqual(lineRangeOffsets(text, 99, 100), { start: 11, end: 16 });
+  assert.equal(text.slice(6, 16), "beta\ngamma");
+
+  // Round-trips cleanly with editorLines.
+  const range = lineRangeOffsets(text, 2, 3);
+  assert.deepEqual(editorLines(text, range.start, range.end, 3), {
+    anchor: 1,
+    head: 2,
+  });
+
+  // Handles CRLF, empty middle lines, no trailing newline, and empty text.
+  assert.deepEqual(lineRangeOffsets("one\r\ntwo\r\n", 1, 1), { start: 0, end: 3 });
+  assert.deepEqual(lineRangeOffsets("one\r\ntwo\r\n", 2, 2), { start: 5, end: 8 });
+  assert.deepEqual(lineRangeOffsets("a\n\nb\n", 2, 2), { start: 2, end: 2 });
+  assert.deepEqual(lineRangeOffsets("solo", 1, 1), { start: 0, end: 4 });
+  assert.deepEqual(lineRangeOffsets("", 1, 1), { start: 0, end: 0 });
 });

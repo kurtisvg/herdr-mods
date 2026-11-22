@@ -53,6 +53,7 @@ import {
   lines,
   where,
   editorLines,
+  lineRangeOffsets,
   locate,
   outdated,
   sortComments,
@@ -75,6 +76,7 @@ import {
   blockFor,
   textKey,
   pictureFile,
+  resolveLink,
   editorLanguage,
   tokenizeLine,
   wrapSpans,
@@ -352,7 +354,9 @@ export class Panel {
     this.copied = false;
     this.copiedTimer = null;
     this.commenting = false;
+    this.history = [];
     this.revealRow = null;
+    this.revealBlock = null;
     this.watched = null; // token of the watch loop that is current
     this.folderWatch = null; // the `watchFolder` call in flight, to cancel it
     this.diagrams = new Diagrams();
@@ -727,6 +731,7 @@ export class Panel {
       next?.ctx === ctx &&
       next.path === this.open.path;
     if (!moved && !stays) this.shut();
+    if (!stays) this.history = [];
     if (moved) {
       this.stopWatch();
       this.files = [];
@@ -925,6 +930,7 @@ export class Panel {
 
   setMode(mode, cx) {
     if (this.open) this.shut();
+    this.history = [];
     this.mode = mode;
     this.seenMode = mode;
     localStorage.setItem("mode", mode);
@@ -1290,9 +1296,11 @@ export class Panel {
     this.jump = null;
     this.reveal = null;
     this.revealRow = null;
+    this.revealBlock = null;
     this.blocks = null;
     this.anchorBlock = null;
     this.headBlock = null;
+    if (this.pick && !this.hasText) this.cancel();
     this.commenting = false;
     this.mdMode = "rendered";
   }
@@ -1301,12 +1309,26 @@ export class Panel {
   // again.
   closeFile() {
     this.shut();
+    this.history = [];
     this.kept.delete(this.tab);
     this.saveViews();
   }
 
-  show(path, view, cx, comment) {
+  show(
+    path,
+    view,
+    cx,
+    {
+      comment = null,
+      lines = null,
+      keepHistory = false,
+      mdMode = "rendered",
+      commenting = null,
+      start = 0,
+    } = {},
+  ) {
     this.shut();
+    if (!keepHistory) this.history = [];
     const target = view === "changes" ? "changes" : "files";
     if (this.mode !== target) {
       this.mode = target;
@@ -1316,12 +1338,41 @@ export class Panel {
     }
     this.open = { path, view: target };
     this.commenting =
-      Boolean(comment) || this.comments().some((c) => c.path === path);
-    this.mdMode = "rendered";
-    this.jump = comment ?? "top";
+      commenting ?? (Boolean(comment) || this.comments().some((c) => c.path === path));
+    this.mdMode = mdMode;
+    this.start = start;
+    this.jump = lines ?? comment ?? "top";
     this.saveViews();
     this.fetch(cx);
     cx.notify();
+  }
+
+  selectEditorLines(lines) {
+    if (
+      !lines ||
+      !this.editor ||
+      this.editorRoot !== this.root ||
+      this.editorPath !== this.open?.path
+    ) {
+      return;
+    }
+    const range = lineRangeOffsets(this.editor.value(), lines.from, lines.to);
+    this.editor.set_selected_range(range);
+  }
+
+  goBack(cx) {
+    const prev = this.history.pop();
+    if (!prev) {
+      this.closeFile();
+      cx.notify();
+      return;
+    }
+    this.show(prev.path, prev.view, cx, {
+      keepHistory: true,
+      mdMode: prev.mdMode,
+      commenting: prev.commenting,
+      start: prev.start,
+    });
   }
 
   async illustrate(blocks, cx) {
@@ -1531,6 +1582,9 @@ export class Panel {
             this.editorPath !== open.path)
         ) {
           this.syncEditor(root, open.path, text, !on);
+          if (this.jump && typeof this.jump === "object") {
+            this.selectEditorLines(this.jump);
+          }
         }
         const live =
           open.view === "files" &&
@@ -2086,7 +2140,9 @@ export class Panel {
           e.bg(t.selected),
         )
         .hover((s) => s.bg(t.hover))
-        .on_click((_e, cx) => this.show(c.path, c.view ?? "files", cx, c.id))
+        .on_click((_e, cx) =>
+          this.show(c.path, c.view ?? "files", cx, { comment: c.id }),
+        )
         .child(
           h_flex()
             .gap(6)
@@ -2306,6 +2362,10 @@ export class Panel {
   }
 
   openLink(url, cx) {
+    if (this.pick && !this.hasText) {
+      this.cancel();
+      cx.notify();
+    }
     if (/^(?:https?:\/\/[^/\s]|mailto:\S)/i.test(url)) {
       try {
         cx.open_url(url);
@@ -2314,28 +2374,31 @@ export class Panel {
       }
       return;
     }
-    // A malformed web or mail address is not a file.
-    if (/^(?:https?|mailto):/i.test(url)) return;
-    const clean = url.split("#")[0];
-    if (!isMarkdown(clean) || !this.open || !this.root) return;
-    let path = decodeURIComponent(
-      clean.startsWith("file://") ? clean.slice(7) : clean,
-    );
-    if (!path.startsWith("/")) {
-      const folder = this.open.path.includes("/")
-        ? this.open.path.replace(/\/[^/]*$/, "/")
-        : "";
-      path = `${this.root}/${folder}${path}`;
+    if (!this.open || !this.root) return;
+    const target = resolveLink(url, `${this.root}/${this.open.path}`, this.root);
+    if (!target) return;
+
+    if (target.path === this.open.path && this.open.view === "files") {
+      if (target.lines) {
+        this.selectEditorLines(target.lines);
+        this.jump = target.lines;
+        cx.notify();
+      }
+      return;
     }
-    const parts = [];
-    for (const part of path.split("/")) {
-      if (part === "..") parts.pop();
-      else if (part && part !== ".") parts.push(part);
-    }
-    path = "/" + parts.join("/");
-    if (path.startsWith(this.root + "/")) {
-      this.show(path.slice(this.root.length + 1), "files", cx);
-    }
+
+    if (this.history.length >= 50) this.history.shift();
+    this.history.push({
+      path: this.open.path,
+      view: this.open.view,
+      mdMode: this.mdMode,
+      commenting: this.commenting,
+      start: this.start,
+    });
+    this.show(target.path, "files", cx, {
+      lines: target.lines,
+      keepHistory: true,
+    });
   }
 
   drawn(t, comments, boxWidth) {
@@ -2481,6 +2544,10 @@ export class Panel {
           .on_mouse_move((_e, cx) => this.dragBlock(i, cx))
           .children(body),
       );
+      if (this.revealBlock === i) {
+        this.scroll.scroll_to_item(out.length - 1);
+        this.revealBlock = null;
+      }
       for (const c of under.get(i) ?? []) push(c);
     });
     if (blocks.some((b) => b.from - 1 >= end)) {
@@ -2494,6 +2561,7 @@ export class Panel {
       );
     }
     this.reveal = null;
+    this.revealBlock = null;
     return out;
   }
 
@@ -2702,6 +2770,7 @@ export class Panel {
     }
     this.reveal = null;
     this.revealRow = null;
+    this.revealBlock = null;
     return out;
   }
 
@@ -2725,6 +2794,7 @@ export class Panel {
       this.seenMode = wanted;
       if (MODES.includes(wanted) && wanted !== this.mode) {
         if (this.open) this.shut();
+        this.history = [];
         this.mode = wanted;
         localStorage.setItem("mode", wanted);
         // After a switch to another tab, `place` opens that tab's file.
@@ -2761,6 +2831,19 @@ export class Panel {
     if (this.jump && this.open && this.ready) {
       if (this.jump === "top") {
         this.scroll.scroll_to_item(0);
+      } else if (typeof this.jump === "object") {
+        const { from } = this.jump;
+        if (this.blocks) {
+          const at = blockFor(this.blocks, from);
+          if (at >= 0) {
+            this.start = Math.floor((this.blocks[at].from - 1) / PAGE) * PAGE;
+            this.revealBlock = at;
+          }
+        } else if (this.rows.length) {
+          const row = Math.max(0, Math.min(from - 1, this.rows.length - 1));
+          this.start = Math.floor(row / PAGE) * PAGE;
+          this.revealRow = row;
+        }
       } else {
         const c = comments.find((c) => c.id === this.jump);
         const at = c ? locate(c, this.rows) : -1;
@@ -2945,10 +3028,7 @@ export class Panel {
             .cursor_pointer()
             .text_color(t.muted)
             .hover((s) => s.text_color(t.foreground))
-            .on_click((_e, cx) => {
-              this.closeFile();
-              cx.notify();
-            })
+            .on_click((_e, cx) => this.goBack(cx))
             .child("←"),
         ),
       )
