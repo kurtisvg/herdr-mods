@@ -78,6 +78,11 @@ rendering.
 - Comment mode and diffs page every 300 rows (`↑` / `↓`); native **Edit** supports local
   files up to 1 MiB.
 - Agent comments live in `<repo>/.herdr/review/<8-hex-key>/<id>.md`
+- Each tab remembers the file it had open and the folders it had expanded in
+  **Files**, and shows them again when you switch back or restart Herdr. **Files** and
+  **Changes** share the open file: **Changes** shows its diff when the file has changes.
+- With the review-panel tab bar, each tab also remembers whether the panel is open, its
+  mode, and its width. A tab that you have not visited starts with the panel closed.
 - Closed tabs keep comments for 30 days and reattach if a new tab gets the same custom
   name.
 - Herdr does not watch files behind symlinks. Run `./plugin.sh reload review-panel`
