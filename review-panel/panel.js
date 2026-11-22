@@ -2425,7 +2425,7 @@ export class Panel {
     });
   }
 
-  drawn(t, comments, boxWidth) {
+  drawn(t, comments, mono, boxWidth) {
     const blocks = this.blocks;
     const out = [];
     const under = new Map();
@@ -2437,6 +2437,15 @@ export class Panel {
       120,
       (this.size?.width ?? 360) - MD_HORIZONTAL_CHROME,
     );
+    const palette = {
+      comment: t.dim,
+      string: t.ansi2,
+      keyword: t.ansi5,
+      fn: t.ansi4,
+      type: t.ansi3,
+      number: t.ansi1,
+      const: t.ansi6,
+    };
     const push = (c, flag) => {
       out.push(this.commentBox(c, t, boxWidth, flag));
       if (this.reveal === c.id) {
@@ -2500,10 +2509,218 @@ export class Panel {
     }
     let diagramSlot = 0;
     const fileName = this.open?.path?.split("/").pop();
+    const QUOTE_BORDER = 3;
+    const QUOTE_PAD = 12;
     blocks.forEach((b, i) => {
       const slot = b.kind === "mermaid" ? diagramSlot++ : -1;
       if (b.from - 1 < this.start || b.from - 1 >= end) return;
       const picked = hi >= b.from && lo <= b.to;
+      const quoteDepth = b.quote ?? 0;
+      const blockRoom = Math.max(120, room - quoteDepth * (QUOTE_BORDER + QUOTE_PAD));
+      const prev = blocks[i - 1];
+      const next = blocks[i + 1];
+      const prevVisible =
+        Boolean(prev) && prev.from - 1 >= this.start && !under.get(i - 1)?.length;
+      const nextVisible =
+        Boolean(next) && next.from - 1 < end && !under.get(i)?.length;
+
+      const wrapQuote = (inner, padTop, padBottom) => {
+        const joinedPrev = prevVisible && prev.quoteGroup === b.quoteGroup;
+        const joinedNext = nextVisible && next.quoteGroup === b.quoteGroup;
+        let quoted = v_flex()
+          .w_full()
+          .gap(4)
+          .pt(padTop)
+          .pb(padBottom)
+          .text_color(t.muted)
+          .child(inner);
+        for (let d = 0; d < quoteDepth; d++) {
+          quoted = v_flex()
+            .w_full()
+            .border_l(QUOTE_BORDER)
+            .border_color(t.border)
+            .pl(QUOTE_PAD)
+            .child(quoted);
+        }
+        return { quoted, joinedPrev, joinedNext };
+      };
+
+      const pushBlockRow = (content, { mt = 0, mb = 0, py = 0, highlightRow = false } = {}) => {
+        const showGutter = this.hoveredBlock === i || picked;
+        const gutter = h_flex()
+          .id(`block-add-${i}`)
+          .w(20)
+          .h(20)
+          .mt(1)
+          .flex_none()
+          .items_center()
+          .justify_center()
+          .rounded(4)
+          .text_size(12)
+          .cursor_pointer()
+          .text_color(picked ? t.accent : t.dim)
+          .when(showGutter, (e) =>
+            e
+              .hover((s) => s.bg(t.hover).text_color(t.foreground))
+              .child("+"),
+          )
+          .on_mouse_down("left", (e, cx) => this.pressBlock(i, e, cx));
+        out.push(
+          h_flex()
+            .id(`block-${i}`)
+            .w_full()
+            .flex_none()
+            .items_start()
+            .gap(6)
+            .mt(mt)
+            .mb(mb)
+            .py(py)
+            .pl(6)
+            .pr(16)
+            .when(highlightRow && picked, (e) => e.bg(t.selected))
+            .on_hover((over, cx) => this.hoverBlock(i, over, cx))
+            .on_mouse_move((_e, cx) => this.dragBlock(i, cx))
+            .child(gutter)
+            .child(v_flex().flex_1().min_w(0).text_size(13).child(content)),
+        );
+        if (this.revealBlock === i) {
+          this.scroll.scroll_to_item(out.length - 1);
+          this.revealBlock = null;
+        }
+        for (const c of under.get(i) ?? []) push(c);
+      };
+
+      const renderPictures = () =>
+        h_flex()
+          .w_full()
+          .flex_wrap()
+          .items_end()
+          .gap(8)
+          .children(
+            b.pictures.map((item) => {
+              const p = this.pictures.get(item.path);
+              if (!p || p.pending) return div();
+              if (p.error) {
+                return note(`Picture not shown: ${item.src}. ${p.error}`);
+              }
+              const width = Math.max(
+                1,
+                Math.round(Math.min(item.width ?? p.width, blockRoom)),
+              );
+              const height = Math.max(
+                1,
+                Math.round((width * p.height) / p.width),
+              );
+              return image(`${PICTURES}/${p.file}`)
+                .w(width)
+                .h(height)
+                .flex_none();
+            }),
+          );
+
+      if (b.kind === "code") {
+        const joinedPrev = prevVisible && prev.codeGroup === b.codeGroup;
+        const joinedNext = nextVisible && next.codeGroup === b.codeGroup;
+        const show = untab(b.text.slice(0, 2000)).slice(0, 2000) || " ";
+        const spans = tokenizeLine(show, LANG[b.lang] ?? b.lang ?? "");
+        const lineEl = h_flex()
+          .w_full()
+          .min_w(0)
+          .overflow_hidden()
+          .whitespace_nowrap()
+          .font_family(mono)
+          .text_size(12)
+          .text_color(t.foreground)
+          .children(
+            spans.map(([s, k]) => {
+              const text = s.replace(/ /g, "\u00a0");
+              return k
+                ? div().flex_none().text_color(palette[k]).child(text)
+                : div().flex_none().child(text);
+            }),
+          );
+        const card = v_flex()
+          .w_full()
+          .px(10)
+          .py(1)
+          .border_l(1)
+          .border_r(1)
+          .border_color(t.border)
+          .bg(picked ? t.selected : t.raised)
+          .when(!picked, (e) => e.hover((s) => s.bg(t.hover)))
+          .when(!joinedPrev, (e) => e.border_t(1).rounded_t(6).pt(6))
+          .when(!joinedNext, (e) => e.border_b(1).rounded_b(6).pb(6))
+          .child(lineEl);
+        if (quoteDepth > 0) {
+          const { quoted, joinedPrev: qPrev, joinedNext: qNext } = wrapQuote(
+            card,
+            joinedPrev ? 0 : 3,
+            joinedNext ? 0 : 3,
+          );
+          pushBlockRow(quoted, { mt: qPrev ? 0 : 3, mb: qNext ? 0 : 3 });
+        } else {
+          pushBlockRow(card, { mt: joinedPrev ? 0 : 4, mb: joinedNext ? 0 : 4 });
+        }
+        return;
+      }
+
+      if (b.kind === "table-row") {
+        const joinedPrev = prevVisible && prev.tableGroup === b.tableGroup;
+        const joinedNext = nextVisible && next.tableGroup === b.tableGroup;
+        const shownCells = b.shownCells ?? b.cells;
+        const tableRow = h_flex()
+          .w_full()
+          .items_stretch()
+          .border_l(1)
+          .border_r(1)
+          .border_b(1)
+          .border_color(t.border)
+          .when(!joinedPrev, (e) => e.border_t(1).rounded_t(6))
+          .when(!joinedNext, (e) => e.rounded_b(6))
+          .when(picked, (e) => e.bg(t.selected))
+          .when(!picked && b.header, (e) => e.bg(t.raised))
+          .when(!picked, (e) => e.hover((s) => s.bg(t.hover)))
+          .children(
+            shownCells.map((cell, c) => {
+              const align = b.alignments[c];
+              const cellText = cell.trim();
+              const inner = cellText
+                ? TextView.markdown(
+                    `review-md-${i}-c${c}-${textKey(cellText)}`,
+                    cellText,
+                  )
+                    .selectable(true)
+                    .on_link_click(link)
+                : div().child(" ");
+              return div()
+                .flex_grow(b.weights[c])
+                .flex_basis(0)
+                .min_w(0)
+                .px(8)
+                .py(5)
+                .when(c > 0, (e) => e.border_l(1).border_color(t.border))
+                .when(align === "right", (e) => e.flex().justify_end())
+                .when(align === "center", (e) => e.flex().justify_center())
+                .when(b.header, (e) => e.font_semibold())
+                .child(inner);
+            }),
+          );
+        const content = b.pictures
+          ? v_flex().w_full().gap(4).child(tableRow).child(renderPictures())
+          : tableRow;
+        if (quoteDepth > 0) {
+          const { quoted, joinedPrev: qPrev, joinedNext: qNext } = wrapQuote(
+            content,
+            joinedPrev ? 0 : 3,
+            joinedNext ? 0 : 3,
+          );
+          pushBlockRow(quoted, { mt: qPrev ? 0 : 3, mb: qNext ? 0 : 3 });
+        } else {
+          pushBlockRow(content, { mt: joinedPrev ? 0 : 4, mb: joinedNext ? 0 : 4 });
+        }
+        return;
+      }
+
       const rawShown = b.shown ?? b.text;
       const text = () => {
         const shownText = bareFences(rawShown);
@@ -2538,7 +2755,7 @@ export class Panel {
             key: slotKey,
             diagram: picture,
             theme: t,
-            width: room,
+            width: blockRoom,
             expandable: true,
             title: fileName
               ? `${fileName} — Diagram ${slot + 1}`
@@ -2552,82 +2769,23 @@ export class Panel {
       } else if (rawShown.trim()) {
         body.push(text());
       }
-      if (b.pictures) {
-        body.push(
-          h_flex()
-            .w_full()
-            .flex_wrap()
-            .items_end()
-            .gap(8)
-            .children(
-              b.pictures.map((item) => {
-                const p = this.pictures.get(item.path);
-                if (!p || p.pending) return div();
-                if (p.error) {
-                  return note(`Picture not shown: ${item.src}. ${p.error}`);
-                }
-                const width = Math.max(
-                  1,
-                  Math.round(Math.min(item.width ?? p.width, room)),
-                );
-                const height = Math.max(
-                  1,
-                  Math.round((width * p.height) / p.width),
-                );
-                return image(`${PICTURES}/${p.file}`)
-                  .w(width)
-                  .h(height)
-                  .flex_none();
-              }),
-            ),
+      if (b.pictures) body.push(renderPictures());
+
+      const bodyEl = v_flex().w_full().gap(4).children(body);
+      if (quoteDepth > 0) {
+        const { quoted, joinedPrev: qPrev, joinedNext: qNext } = wrapQuote(
+          bodyEl,
+          3,
+          3,
         );
+        pushBlockRow(quoted, {
+          mt: qPrev ? 0 : 3,
+          mb: qNext ? 0 : 3,
+          highlightRow: true,
+        });
+      } else {
+        pushBlockRow(bodyEl, { py: 3, highlightRow: true });
       }
-      const showGutter = this.hoveredBlock === i || picked;
-      const gutter = h_flex()
-        .id(`block-add-${i}`)
-        .w(20)
-        .h(20)
-        .mt(1)
-        .flex_none()
-        .items_center()
-        .justify_center()
-        .rounded(4)
-        .text_size(12)
-        .cursor_pointer()
-        .text_color(picked ? t.accent : t.dim)
-        .when(showGutter, (e) =>
-          e
-            .hover((s) => s.bg(t.hover).text_color(t.foreground))
-            .child("+"),
-        )
-        .on_mouse_down("left", (e, cx) => this.pressBlock(i, e, cx));
-      const content = v_flex()
-        .flex_1()
-        .min_w(0)
-        .gap(4)
-        .text_size(13)
-        .children(body);
-      out.push(
-        h_flex()
-          .id(`block-${i}`)
-          .w_full()
-          .flex_none()
-          .items_start()
-          .gap(6)
-          .py(3)
-          .pl(6)
-          .pr(16)
-          .when(picked, (e) => e.bg(t.selected))
-          .on_hover((over, cx) => this.hoverBlock(i, over, cx))
-          .on_mouse_move((_e, cx) => this.dragBlock(i, cx))
-          .child(gutter)
-          .child(content),
-      );
-      if (this.revealBlock === i) {
-        this.scroll.scroll_to_item(out.length - 1);
-        this.revealBlock = null;
-      }
-      for (const c of under.get(i) ?? []) push(c);
     });
     if (blocks.some((b) => b.from - 1 >= end)) {
       const lastLine = Math.min(this.rows.length, end + PAGE);
@@ -3488,7 +3646,7 @@ export class Panel {
                   !this.ready
                     ? [div().flex_none().px(12).py(8).text_color(t.dim).child("Loading…")]
                     : this.blocks
-                      ? this.drawn(t, comments, drawnBoxW)
+                      ? this.drawn(t, comments, mono, drawnBoxW)
                       : this.code(t, comments, mono, codeBoxW, cx),
                 ),
             )

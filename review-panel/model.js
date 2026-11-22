@@ -831,41 +831,181 @@ export function parseFrontmatter(text) {
   };
 }
 
-// Splits a markdown file into clickable visual blocks: [{ kind, from, to, text }]
-// with 1-based inclusive line numbers. Leading YAML frontmatter (`kind: "frontmatter"`)
-// carries parsed `entries`. Mermaid blocks (`kind: "mermaid"`) carry `code` without
-// fences. When `where` is given (see liftPictures), blocks that reference local
-// pictures also carry `pictures` and `shown`.
+const QUOTE_RE = /^ {0,3}>/;
+const FENCE_OPEN_RE = /^ {0,3}(?:(`{3,})([^`]*)|(~{3,})(.*))$/;
+const FENCE_CLOSE_RE = /^ {0,3}(`{3,}|~{3,})\s*$/;
+const HEADING_RE = /^ {0,3}#{1,6}(\s|$)/;
+const RULE_RE = /^ {0,3}([-*_])( *\1){2,}\s*$/;
+const SETEXT_RE = /^ {0,3}(=+|-+)\s*$/;
+const TABLE_RE = /^ {0,3}\|/;
+const LIST_ITEM_RE = /^ {0,3}([-*+]|\d{1,9}[.)])\s/;
+const INDENTED_RE = /^(\t| {2,})\S/;
+
+function closesFence(line, fence) {
+  const end = FENCE_CLOSE_RE.exec(line);
+  return Boolean(end && end[1][0] === fence.char && end[1].length >= fence.length);
+}
+
+// Removes one leading CommonMark blockquote marker (`>` with up to 3 leading
+// spaces and an optional following space or tab).
+function stripQuoteMarker(line) {
+  const match = QUOTE_RE.exec(line);
+  if (!match) return line;
+  const rest = line.slice(match[0].length);
+  if (rest.startsWith(" ")) return rest.slice(1);
+  // CommonMark: a tab right after `>` supplies the optional 1-space separator
+  // and leaves 3 spaces toward the 4-column tab stop.
+  if (rest.startsWith("\t")) return "   " + rest.slice(1);
+  return rest;
+}
+
+// Updates a blockquote's inner fence state and whether a plain line without `>`
+// may lazily continue it. Called for each `>`-prefixed line (lazy continuations
+// are always plain paragraph lines and leave `lazyOk` true).
+function updateQuoteState(cur, inner) {
+  if (cur.innerFence) {
+    if (closesFence(inner, cur.innerFence)) cur.innerFence = null;
+    cur.lazyOk = false;
+    return;
+  }
+  const fence = FENCE_OPEN_RE.exec(inner);
+  if (fence) {
+    const mark = fence[1] ?? fence[3];
+    cur.innerFence = { char: mark[0], length: mark.length };
+    cur.lazyOk = false;
+    return;
+  }
+  if (
+    !inner.trim() ||
+    HEADING_RE.test(inner) ||
+    RULE_RE.test(inner) ||
+    TABLE_RE.test(inner) ||
+    QUOTE_RE.test(inner) ||
+    (cur.lazyOk && SETEXT_RE.test(inner))
+  ) {
+    cur.lazyOk = false;
+    return;
+  }
+  cur.lazyOk = true;
+}
+
+// Splits a non-mermaid fenced code block into one commentable `code` block per
+// body line, keeping exact 1-based line numbers and a shared `codeGroup`.
+function codeBlocks(cur, codeGroup, quoteMeta) {
+  const bodyEnd = cur.closed ? cur.lines.length - 1 : cur.lines.length;
+  if (bodyEnd <= 1) {
+    return [
+      {
+        kind: "code",
+        from: cur.from,
+        to: cur.from + cur.lines.length - 1,
+        text: "",
+        lang: cur.lang,
+        codeGroup,
+        ...quoteMeta,
+      },
+    ];
+  }
+  const blocks = [];
+  for (let k = 1; k < bodyEnd; k++) {
+    blocks.push({
+      kind: "code",
+      from: cur.from + k,
+      to: cur.from + k,
+      text: cur.lines[k],
+      lang: cur.lang,
+      codeGroup,
+      ...quoteMeta,
+    });
+  }
+  return blocks;
+}
+
+// Splits a valid GFM table into one commentable `table-row` block per row
+// (header + delimiter share the first block) with shared column alignments and
+// proportional weights. Returns null if `cur.lines` is not a valid GFM table.
+function tableBlocks(cur, tableGroup, quoteMeta) {
+  if (cur.lines.length < 2) return null;
+  const headerCells = splitTableRow(cur.lines[0]);
+  const sepCells = splitTableRow(cur.lines[1]);
+  const rawAligns = parseTableDelimiter(sepCells);
+  if (!headerCells || !rawAligns) return null;
+
+  const bodyRows = cur.lines
+    .slice(2)
+    .map((line) => splitTableRow(line) ?? [line.trim()]);
+  const cols = Math.max(
+    headerCells.length,
+    rawAligns.length,
+    ...bodyRows.map((row) => row.length),
+  );
+  const pad = (row) =>
+    Array.from({ length: cols }, (_, c) => (row[c] ?? "").trim());
+  const alignments = Array.from({ length: cols }, (_, c) => {
+    const a = rawAligns[c] ?? "left";
+    return a === "left-explicit" ? "left" : a;
+  });
+
+  const paddedHeader = pad(headerCells);
+  const paddedBody = bodyRows.map(pad);
+  const allRows = [paddedHeader, ...paddedBody];
+  const weights = Array.from({ length: cols }, (_, c) => {
+    const maxLen = Math.max(...allRows.map((row) => row[c].length));
+    return Math.max(4, Math.min(40, maxLen));
+  });
+
+  const blocks = [
+    {
+      kind: "table-row",
+      from: cur.from,
+      to: cur.from + 1,
+      header: true,
+      cells: paddedHeader,
+      alignments,
+      weights,
+      tableGroup,
+      text: cur.lines.slice(0, 2).join("\n"),
+      ...quoteMeta,
+    },
+  ];
+  for (let k = 0; k < paddedBody.length; k++) {
+    blocks.push({
+      kind: "table-row",
+      from: cur.from + 2 + k,
+      to: cur.from + 2 + k,
+      header: false,
+      cells: paddedBody[k],
+      alignments,
+      weights,
+      tableGroup,
+      text: cur.lines[2 + k],
+      ...quoteMeta,
+    });
+  }
+  return blocks;
+}
+
+// Splits a markdown file into clickable visual blocks with 1-based inclusive
+// line numbers:
+//   - `frontmatter` leading YAML frontmatter carrying parsed `entries`
+//   - `md`          markdown text (paragraphs, headings, list items, rules)
+//   - `mermaid`     mermaid diagram block carrying `code` without fences
+//   - `code`        one line of a fenced code block (`lang`, `codeGroup`)
+//   - `table-row`   one row of a GFM table (`header`, `cells`, `alignments`,
+//                   `weights`, `tableGroup`)
+// Blocks inside blockquotes are split recursively and carry `quote` (nesting
+// depth) and `quoteGroup` (shared by parts of one quote) with outer `>` markers
+// stripped from `text`. When `where` is given (see liftPictures), blocks that
+// reference local pictures also carry `pictures` and `shown` (or `shownCells`).
 export function markdownBlocks(text, where) {
   const src = text
     .replace(/\n$/, "")
     .split("\n")
     .map((line) => line.replace(/\r$/, ""));
   const out = [];
-  let cur = null;
-
-  const close = () => {
-    if (!cur) return;
-    while (cur.lines.length && !cur.lines[cur.lines.length - 1].trim()) {
-      cur.lines.pop();
-    }
-    const block = {
-      kind: cur.mermaid ? "mermaid" : "md",
-      from: cur.from,
-      to: cur.from + cur.lines.length - 1,
-      text: cur.lines.join("\n"),
-    };
-    if (cur.mermaid) {
-      block.code = cur.lines.slice(1, cur.closed ? -1 : undefined).join("\n");
-    }
-    out.push(block);
-    cur = null;
-  };
-  const start = (type, i, extra) => {
-    close();
-    cur = { type, from: i + 1, lines: [src[i]], ...extra };
-  };
-  const indented = (line) => /^(\t| {2,})\S/.test(line);
+  let quoteGroups = 0;
+  let codeGroups = 0;
+  let tableGroups = 0;
 
   let startLine = 0;
   const fm = parseFrontmatterLines(src);
@@ -880,86 +1020,168 @@ export function markdownBlocks(text, where) {
     startLine = fm.endLine;
   }
 
-  for (let i = startLine; i < src.length; i++) {
-    const line = src[i];
-    if (cur?.type === "fence") {
-      cur.lines.push(line);
-      const end = /^ {0,3}(`{3,}|~{3,})\s*$/.exec(line);
-      if (end && end[1][0] === cur.char && end[1].length >= cur.length) {
-        cur.closed = true;
-        close();
+  const parse = (lines, baseLine, quoteDepth, quoteGroup) => {
+    let cur = null;
+    const quoteMeta = quoteDepth > 0 ? { quote: quoteDepth, quoteGroup } : {};
+
+    const close = () => {
+      if (!cur) return;
+      if (cur.type === "quote") {
+        const group = quoteGroup ?? ++quoteGroups;
+        const inner = cur.lines.map(stripQuoteMarker);
+        const startLine = cur.from;
+        cur = null;
+        parse(inner, startLine, quoteDepth + 1, group);
+        return;
       }
-      continue;
-    }
-    const fence = /^ {0,3}(?:(`{3,})([^`]*)|(~{3,})(.*))$/.exec(line);
-    if (fence) {
-      const mark = fence[1] ?? fence[3];
-      const lang = /^\s*\{?\.?([^\s`}]*)/.exec(fence[2] ?? fence[4])[1];
-      start("fence", i, {
-        char: mark[0],
-        length: mark.length,
-        mermaid: lang.toLowerCase() === "mermaid",
-      });
-      continue;
-    }
-    if (!line.trim()) {
-      // Blank lines end a block unless a list item continues indented below.
-      let next = i + 1;
-      while (next < src.length && !src[next].trim()) next++;
-      if (cur?.type === "item" && next < src.length && indented(src[next])) {
+      if (cur.type === "fence" && !cur.mermaid) {
+        out.push(...codeBlocks(cur, ++codeGroups, quoteMeta));
+        cur = null;
+        return;
+      }
+      while (cur.lines.length && !cur.lines[cur.lines.length - 1].trim()) {
+        cur.lines.pop();
+      }
+      if (!cur.lines.length) {
+        cur = null;
+        return;
+      }
+      if (cur.type === "table") {
+        const rows = tableBlocks(cur, tableGroups + 1, quoteMeta);
+        if (rows) {
+          tableGroups += 1;
+          out.push(...rows);
+          cur = null;
+          return;
+        }
+      }
+      const block = {
+        kind: cur.mermaid ? "mermaid" : "md",
+        from: cur.from,
+        to: cur.from + cur.lines.length - 1,
+        text: cur.lines.join("\n"),
+        ...quoteMeta,
+      };
+      if (cur.mermaid) {
+        block.code = cur.lines.slice(1, cur.closed ? -1 : undefined).join("\n");
+      }
+      out.push(block);
+      cur = null;
+    };
+    const start = (type, i, extra) => {
+      close();
+      cur = { type, from: baseLine + i, lines: [lines[i]], ...extra };
+    };
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (cur?.type === "fence") {
+        cur.lines.push(line);
+        if (closesFence(line, cur)) {
+          cur.closed = true;
+          close();
+        }
+        continue;
+      }
+      const fence = FENCE_OPEN_RE.exec(line);
+      if (fence) {
+        const mark = fence[1] ?? fence[3];
+        const lang = /^\s*\{?\.?([^\s`}]*)/.exec(fence[2] ?? fence[4])[1].toLowerCase();
+        start("fence", i, {
+          char: mark[0],
+          length: mark.length,
+          lang,
+          mermaid: lang === "mermaid",
+        });
+        continue;
+      }
+      if (!line.trim()) {
+        // Blank lines end a block unless a list item continues indented below.
+        let next = i + 1;
+        while (next < lines.length && !lines[next].trim()) next++;
+        if (cur?.type === "item" && next < lines.length && INDENTED_RE.test(lines[next])) {
+          cur.lines.push(line);
+        } else {
+          close();
+        }
+        continue;
+      }
+      if (HEADING_RE.test(line)) {
+        start("heading", i);
+        close();
+        continue;
+      }
+      if (cur?.type === "para" && SETEXT_RE.test(line)) {
+        cur.lines.push(line);
+        close();
+        continue;
+      }
+      if (RULE_RE.test(line)) {
+        start("rule", i);
+        close();
+        continue;
+      }
+      if (cur?.type === "item" && INDENTED_RE.test(line)) {
+        cur.lines.push(line);
+        continue;
+      }
+      if (LIST_ITEM_RE.test(line)) {
+        start("item", i);
+        continue;
+      }
+      if (QUOTE_RE.test(line)) {
+        if (cur?.type === "quote") {
+          cur.lines.push(line);
+        } else {
+          start("quote", i, { innerFence: null, lazyOk: false });
+        }
+        updateQuoteState(cur, stripQuoteMarker(line));
+        continue;
+      }
+      const type = TABLE_RE.test(line) ? "table" : "para";
+      // Limit lazy continuation to top-level quotes so shallower `>` lines do
+      // not get absorbed into a nested quote.
+      const continuesQuote =
+        type === "para" &&
+        cur?.type === "quote" &&
+        quoteDepth === 0 &&
+        cur.lazyOk &&
+        !SETEXT_RE.test(line);
+      const continues =
+        cur &&
+        (cur.type === type ||
+          (type === "para" && cur.type === "item") ||
+          continuesQuote);
+      if (continues) {
         cur.lines.push(line);
       } else {
-        close();
+        start(type, i);
       }
-      continue;
     }
-    if (/^ {0,3}#{1,6}(\s|$)/.test(line)) {
-      start("heading", i);
-      close();
-      continue;
-    }
-    if (cur?.type === "para" && /^ {0,3}(=+|-+)\s*$/.test(line)) {
-      cur.lines.push(line);
-      close();
-      continue;
-    }
-    if (/^ {0,3}([-*_])( *\1){2,}\s*$/.test(line)) {
-      start("rule", i);
-      close();
-      continue;
-    }
-    if (cur?.type === "item" && indented(line)) {
-      cur.lines.push(line);
-      continue;
-    }
-    if (/^ {0,3}([-*+]|\d{1,9}[.)])\s/.test(line)) {
-      start("item", i);
-      continue;
-    }
-    const type = /^ {0,3}\|/.test(line)
-      ? "table"
-      : /^ {0,3}>/.test(line)
-        ? "quote"
-        : "para";
-    if (
-      cur &&
-      (cur.type === type ||
-        (type === "para" && (cur.type === "item" || cur.type === "quote")))
-    ) {
-      cur.lines.push(line);
-    } else {
-      start(type, i);
-    }
-  }
-  close();
+    close();
+  };
+
+  parse(src.slice(startLine), startLine + 1, 0, null);
 
   if (where) {
     for (const block of out) {
-      if (block.kind !== "md") continue;
-      const lifted = liftPictures(block.text, where);
-      if (lifted.pictures.length) {
-        block.shown = lifted.text;
-        block.pictures = lifted.pictures;
+      if (block.kind === "md") {
+        const lifted = liftPictures(block.text, where);
+        if (lifted.pictures.length) {
+          block.shown = lifted.text;
+          block.pictures = lifted.pictures;
+        }
+      } else if (block.kind === "table-row") {
+        const pictures = [];
+        const shownCells = block.cells.map((cell) => {
+          const lifted = liftPictures(cell, where);
+          pictures.push(...lifted.pictures);
+          return lifted.text;
+        });
+        if (pictures.length) {
+          block.shownCells = shownCells;
+          block.pictures = pictures;
+        }
       }
     }
   }

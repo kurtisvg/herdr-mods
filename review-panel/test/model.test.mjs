@@ -677,8 +677,11 @@ test("markdownBlocks splits a file into the blocks a reader sees, with their lin
       "md 9-11",
       "md 13-13",
       "md 14-14",
-      "md 16-18",
-      "md 20-24",
+      "table-row 16-17",
+      "table-row 18-18",
+      "code 21-21",
+      "code 22-22",
+      "code 23-23",
       "md 25-26",
       "mermaid 28-31",
       "md 32-33",
@@ -688,8 +691,19 @@ test("markdownBlocks splits a file into the blocks a reader sees, with their lin
   );
   assert.equal(blocks[1].text, "A paragraph that\nruns over two lines.");
   assert.equal(blocks[4].text, "- second item\n\n  still the second item");
-  assert.equal(blocks[8].text.split("\n").length, 5);
-  assert.equal(blocks[10].code, "graph TD\n  A --> B");
+  assert.deepEqual(blocks[7].cells, ["a", "b"]);
+  assert.equal(blocks[7].header, true);
+  assert.deepEqual(blocks[8].cells, ["1", "2"]);
+  assert.equal(blocks[8].header, false);
+  assert.deepEqual(
+    blocks.slice(9, 12).map((b) => [b.lang, b.codeGroup, b.text]),
+    [
+      ["js", 1, "const x = 1;"],
+      ["js", 1, ""],
+      ["js", 1, "# not a heading"],
+    ],
+  );
+  assert.equal(blocks[13].code, "graph TD\n  A --> B");
   for (let i = 1; i < blocks.length; i++) {
     assert.ok(blocks[i].from > blocks[i - 1].to);
   }
@@ -706,12 +720,230 @@ test("markdownBlocks keeps an unclosed fence to the end, and handles an empty fi
   assert.deepEqual(markdownBlocks("\n\n"), []);
 });
 
+test("markdownBlocks splits fenced code blocks per line, including empty and unclosed fences", () => {
+  const md = [
+    "```python", // 1
+    "def hi():", // 2
+    "", // 3
+    "    return 1", // 4
+    "```", // 5
+    "", // 6
+    "```", // 7
+    "```", // 8
+    "", // 9
+    "~~~sh", // 10
+    "echo a", // 11
+    "echo b", // 12
+  ].join("\n");
+  const blocks = markdownBlocks(md);
+  assert.deepEqual(
+    blocks.map((b) => [b.kind, b.from, b.to, b.lang, b.codeGroup, b.text]),
+    [
+      ["code", 2, 2, "python", 1, "def hi():"],
+      ["code", 3, 3, "python", 1, ""],
+      ["code", 4, 4, "python", 1, "    return 1"],
+      ["code", 7, 8, "", 2, ""],
+      ["code", 11, 11, "sh", 3, "echo a"],
+      ["code", 12, 12, "sh", 3, "echo b"],
+    ],
+  );
+});
+
+test("markdownBlocks splits GFM tables per row with alignments, weights, and fallback", () => {
+  const md = [
+    "| Name | Score | Notes |", // 1
+    "| :--- | :---: | ---: |", // 2
+    "| Alice | 10 | `a|b` |", // 3
+    "| Bob | 20 | ok |", // 4
+    "", // 5
+    "| just a pipe line |", // 6
+  ].join("\n");
+  const blocks = markdownBlocks(md);
+  assert.deepEqual(
+    blocks.map((b) => [b.kind, b.from, b.to, b.tableGroup ?? 0]),
+    [
+      ["table-row", 1, 2, 1],
+      ["table-row", 3, 3, 1],
+      ["table-row", 4, 4, 1],
+      ["md", 6, 6, 0],
+    ],
+  );
+  assert.equal(blocks[0].header, true);
+  assert.equal(blocks[1].header, false);
+  assert.deepEqual(blocks[0].alignments, ["left", "center", "right"]);
+  assert.deepEqual(blocks[1].cells, ["Alice", "10", "`a|b`"]);
+  assert.deepEqual(blocks[0].weights, blocks[1].weights);
+  assert.deepEqual(blocks[1].weights, blocks[2].weights);
+
+  const withPic = markdownBlocks(
+    "| A | B |\n|---|---|\n| ![one](a.png) | two |\n",
+    (src) => pictureFile(src, "/repo/docs"),
+  );
+  assert.deepEqual(withPic[1].shownCells, ["", "two"]);
+  assert.equal(withPic[1].pictures.length, 1);
+  assert.equal(withPic[1].pictures[0].path, "/repo/docs/a.png");
+});
+
+test("markdownBlocks splits multi-paragraph and multi-part quotes with exact line ranges", () => {
+  const md = [
+    "> ## Quoted Heading", // 1
+    "> First paragraph", // 2
+    "> continues here.", // 3
+    ">", // 4
+    "> Second paragraph.", // 5
+    ">", // 6
+    "> - first item", // 7
+    "> - second item", // 8
+    ">", // 9
+    ">   still second", // 10
+    ">", // 11
+    "> ```js", // 12
+    "> const a = 1;", // 13
+    ">", // 14
+    "> const b = 2;", // 15
+    "> ```", // 16
+    "> | x | y |", // 17
+    "> |---|---|", // 18
+    "> | 1 | 2 |", // 19
+    "> ---", // 20
+    "> ```mermaid", // 21
+    "> graph TD", // 22
+    ">   A --> B", // 23
+    "> ```", // 24
+  ].join("\n");
+  const blocks = markdownBlocks(md);
+  assert.deepEqual(
+    blocks.map((b) => `${b.kind} ${b.from}-${b.to} q${b.quote}g${b.quoteGroup}`),
+    [
+      "md 1-1 q1g1",
+      "md 2-3 q1g1",
+      "md 5-5 q1g1",
+      "md 7-7 q1g1",
+      "md 8-10 q1g1",
+      "code 13-13 q1g1",
+      "code 14-14 q1g1",
+      "code 15-15 q1g1",
+      "table-row 17-18 q1g1",
+      "table-row 19-19 q1g1",
+      "md 20-20 q1g1",
+      "mermaid 21-24 q1g1",
+    ],
+  );
+  assert.equal(blocks[0].text, "## Quoted Heading");
+  assert.equal(blocks[1].text, "First paragraph\ncontinues here.");
+  assert.equal(blocks[4].text, "- second item\n\n  still second");
+  assert.deepEqual(
+    blocks.slice(5, 8).map((b) => [b.lang, b.codeGroup, b.text]),
+    [
+      ["js", 1, "const a = 1;"],
+      ["js", 1, ""],
+      ["js", 1, "const b = 2;"],
+    ],
+  );
+  assert.deepEqual(blocks[8].cells, ["x", "y"]);
+  assert.deepEqual(blocks[9].cells, ["1", "2"]);
+  assert.equal(blocks[11].code, "graph TD\n  A --> B");
+  assert.equal(blockFor(blocks, 4), 1);
+});
+
+test("markdownBlocks tracks nested quote depth and separates distinct quote groups", () => {
+  const md = [
+    "> Outer one", // 1
+    ">", // 2
+    "> > Inner one", // 3
+    "> >", // 4
+    "> > Inner two", // 5
+    ">", // 6
+    "> Outer two", // 7
+    "", // 8
+    "> Separate quote", // 9
+  ].join("\n");
+  const blocks = markdownBlocks(md);
+  assert.deepEqual(
+    blocks.map((b) => [b.from, b.to, b.quote, b.quoteGroup, b.text]),
+    [
+      [1, 1, 1, 1, "Outer one"],
+      [3, 3, 2, 1, "Inner one"],
+      [5, 5, 2, 1, "Inner two"],
+      [7, 7, 1, 1, "Outer two"],
+      [9, 9, 1, 2, "Separate quote"],
+    ],
+  );
+});
+
+test("markdownBlocks limits quote lazy continuation to plain paragraphs", () => {
+  const md = [
+    "> # Heading", // 1
+    "outside heading", // 2
+    "", // 3
+    "> ```js", // 4
+    "> x()", // 5
+    "> ```", // 6
+    "outside fence", // 7
+    "", // 8
+    ">", // 9
+    "> body", // 10
+    ">", // 11
+    "outside empty", // 12
+    "", // 13
+    "> Title", // 14
+    "> -----", // 15
+    "outside setext", // 16
+    "", // 17
+    "> Quoted line", // 18
+    "===", // 19
+  ].join("\n");
+  const blocks = markdownBlocks(md);
+  assert.deepEqual(
+    blocks.map((b) => [b.from, b.to, b.quote ?? 0, b.text]),
+    [
+      [1, 1, 1, "# Heading"],
+      [2, 2, 0, "outside heading"],
+      [5, 5, 1, "x()"],
+      [7, 7, 0, "outside fence"],
+      [10, 10, 1, "body"],
+      [12, 12, 0, "outside empty"],
+      [14, 15, 1, "Title\n-----"],
+      [16, 16, 0, "outside setext"],
+      [18, 18, 1, "Quoted line"],
+      [19, 19, 0, "==="],
+    ],
+  );
+});
+
+test("markdownBlocks strips tabbed quote markers and drops empty-only quotes", () => {
+  assert.deepEqual(markdownBlocks(">\n>"), []);
+  const tabbed = markdownBlocks(">\tindented");
+  assert.deepEqual(
+    tabbed.map((b) => [b.from, b.to, b.quote, b.text]),
+    [[1, 1, 1, "   indented"]],
+  );
+});
+
+test("markdownBlocks lifts pictures inside split quote blocks without stray markers", () => {
+  const blocks = markdownBlocks(
+    "> Intro\n>\n> ![Shot](images/a.png)\n",
+    (src) => pictureFile(src, "/repo/docs"),
+  );
+  assert.equal(blocks.length, 2);
+  assert.deepEqual(
+    blocks.map((b) => [b.from, b.to, b.quote, b.quoteGroup]),
+    [
+      [1, 1, 1, 1],
+      [3, 3, 1, 1],
+    ],
+  );
+  assert.equal(blocks[1].shown, "");
+  assert.equal(blocks[1].pictures.length, 1);
+  assert.equal(blocks[1].pictures[0].path, "/repo/docs/images/a.png");
+});
+
 test("blockFor finds the block of a line, or the one before a blank line", () => {
   const blocks = markdownBlocks(MD);
   assert.equal(blockFor(blocks, 4), 1);
   assert.equal(blockFor(blocks, 5), 1);
-  assert.equal(blockFor(blocks, 30), 10);
-  assert.equal(blockFor(blocks, 99), 13);
+  assert.equal(blockFor(blocks, 30), 13);
+  assert.equal(blockFor(blocks, 99), 16);
   assert.equal(blockFor(markdownBlocks("\n\ntext"), 1), -1);
 });
 
