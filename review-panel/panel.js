@@ -87,6 +87,7 @@ import {
 } from "./model.js";
 import { Diagrams } from "./diagrams.js";
 import { frontmatterCard } from "./doc.js";
+import { DiagramViews } from "./diagram-view.js";
 import { Pictures, CACHE as PICTURES } from "./pictures.js";
 
 const MODES = ["files", "changes", "comments"];
@@ -367,6 +368,8 @@ export class Panel {
     this.watched = null; // token of the watch loop that is current
     this.folderWatch = null; // the `watchFolder` call in flight, to cancel it
     this.diagrams = new Diagrams();
+    this.diagramViews = new DiagramViews();
+    this.diagramSig = null;
     this.pictures = new Pictures();
     this.scroll = ScrollHandle.new();
     this.handle = cx.focus_handle();
@@ -1385,6 +1388,7 @@ export class Panel {
   }
 
   async illustrate(blocks, cx) {
+    this.diagramSig = this.diagrams.signature();
     const paths = blocks.flatMap((b) => (b.pictures ?? []).map((p) => p.path));
     const codes = blocks
       .filter((b) => b.kind === "mermaid" && b.code.trim())
@@ -2494,7 +2498,10 @@ export class Panel {
         ),
       );
     }
+    let diagramSlot = 0;
+    const fileName = this.open?.path?.split("/").pop();
     blocks.forEach((b, i) => {
+      const slot = b.kind === "mermaid" ? diagramSlot++ : -1;
       if (b.from - 1 < this.start || b.from - 1 >= end) return;
       const picked = hi >= b.from && lo <= b.to;
       const rawShown = b.shown ?? b.text;
@@ -2507,8 +2514,9 @@ export class Panel {
           .selectable(true)
           .on_link_click(link);
       };
+      const slotKey = slot >= 0 ? `${this.open.path}#${slot}` : null;
       const picture =
-        b.kind === "mermaid" ? this.diagrams.get(b.code) : undefined;
+        b.kind === "mermaid" ? this.diagrams.get(b.code, slotKey) : undefined;
       const body = [];
       if (b.kind === "frontmatter") {
         body.push(
@@ -2524,12 +2532,18 @@ export class Panel {
           ),
         );
       } else if (picture?.path) {
-        const scale = Math.min(1, room / picture.width);
         body.push(
-          image(picture.path)
-            .w(Math.round(picture.width * scale))
-            .h(Math.round(picture.height * scale))
-            .flex_none(),
+          this.diagramViews.renderCard({
+            id: `panel-diagram-${i}`,
+            key: slotKey,
+            diagram: picture,
+            theme: t,
+            width: room,
+            expandable: true,
+            title: fileName
+              ? `${fileName} — Diagram ${slot + 1}`
+              : `Diagram ${slot + 1}`,
+          }),
         );
       } else if (picture?.pending) {
         body.push(note("Drawing diagram…"), text());
@@ -2882,6 +2896,19 @@ export class Panel {
       (this.key() !== this.context?.key || names !== this.names || needFiles || stale)
     ) {
       this.refresh(cx);
+    }
+
+    if (
+      !checking() &&
+      shown() !== false &&
+      this.open &&
+      this.blocks?.length &&
+      this.diagrams.signature() !== this.diagramSig
+    ) {
+      this.diagramSig = this.diagrams.signature();
+      if (this.blocks.some((b) => b.kind === "mermaid" && b.code.trim())) {
+        cx.spawn((cx) => this.illustrate(this.blocks, cx));
+      }
     }
 
     const t = theme();

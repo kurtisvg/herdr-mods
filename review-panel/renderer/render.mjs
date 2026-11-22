@@ -101,7 +101,12 @@ try {
         config.theme = "base";
         config.themeVariables = { darkMode: dark, ...vars };
       }
-      if (font) config.fontFamily = font;
+      if (font) {
+        config.fontFamily = font;
+        if (config.themeVariables && !config.themeVariables.fontFamily) {
+          config.themeVariables.fontFamily = font;
+        }
+      }
       window.mermaid.initialize(config);
     },
     Boolean(job.dark),
