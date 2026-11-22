@@ -2,14 +2,15 @@
 // `tabs` mod for the `review-panel` side panel.
 //
 // When the side panel holds `review-panel`, the right-hand buttons show Files,
-// Changes, and Comments. They switch modes through `shared("review-panel.mode")`
-// and remember each space's choice. Layouts without `review-panel` keep Herdr's
-// standard `tabs` behavior.
+// Changes, and Comments. They switch modes through `shared("review-panel.mode")`.
+// Each tab remembers whether the side panel is open, its mode, and its size.
+// Layouts without `review-panel` keep Herdr's standard `tabs` behavior.
 
 import { div, svg, image } from "gpui-kit";
 import { h_flex, ScrollHandle } from "gpui-base";
 import {
   layout,
+  machines,
   openOverlay,
   panes,
   run,
@@ -20,6 +21,7 @@ import {
   theme,
   window,
 } from "herdr";
+import { machineOf, sameSize, samePanel } from "./model.js";
 
 function findNode(node, id) {
   if (node?.id === id) return node;
@@ -79,9 +81,35 @@ function tabLabel(tab, lead) {
   return usesAutoName && isInformative ? live : fallback;
 }
 
+function findParent(node, id) {
+  for (const child of node?.children ?? []) {
+    if (child.id === id) return node;
+    const found = findParent(child, id);
+    if (found) return found;
+  }
+  return null;
+}
+
+// The size of the node `id` and of its siblings, by node id. Dragging the
+// boundary of a node that has a weight also changes its siblings' weights.
+function sizesAround(root, id) {
+  const sizes = {};
+  for (const child of findParent(root, id)?.children ?? []) {
+    const { px, weight } = child.size ?? {};
+    if (!child.id) continue;
+    if (typeof px === "number") sizes[child.id] = { px };
+    else if (typeof weight === "number") sizes[child.id] = { weight };
+  }
+  return sizes;
+}
+
+// The saved side panel of each tab, by tab id: `{ mode, sizes }`. A null
+// `mode` is a closed panel.
 function loadSavedPanels() {
+  // Earlier versions saved one mode per space under this key.
+  localStorage.removeItem("panels");
   try {
-    const parsed = JSON.parse(localStorage.getItem("panels") ?? "{}");
+    const parsed = JSON.parse(localStorage.getItem("tabPanels") ?? "{}");
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
       return parsed;
     }
@@ -151,7 +179,21 @@ function resolvePanelState(root) {
     run("layout.show", { id: "panel" });
   };
 
-  return { panel, enabled, activeMode, applyMode };
+  const sizes = sizesAround(root, "panel");
+
+  // Shows what a tab saved: the size first, then the mode.
+  const applyPanel = (saved) => {
+    if (saved.mode) {
+      for (const [id, size] of Object.entries(saved.sizes ?? {})) {
+        if (sizes[id] && !sameSize(size, sizes[id])) {
+          run("layout.resize", { id, ...size });
+        }
+      }
+    }
+    applyMode(saved.mode ?? null);
+  };
+
+  return { panel, enabled, activeMode, sizes, applyMode, applyPanel };
 }
 
 export class Tabs {
@@ -194,50 +236,59 @@ export class Tabs {
     run(event.delta.y > 0 ? "tab.prev" : "tab.next");
   }
 
-  // Remembers each space's side-panel mode across space switches. On startup, an
-  // unseen initial space keeps the layout's panel state. Switching to another
-  // unseen space later hides the panel.
-  syncPanel(space, panel, activeMode, enabled, applyMode) {
-    if (!space || !panel) return;
+  // Forgets the tabs that no longer exist. A machine that is not connected
+  // lists no tabs, so its tabs stay.
+  prunePanels() {
+    const live = new Set(spaces().flatMap((s) => s.tabs.map((t) => t.id)));
+    const ready = new Set(
+      machines()
+        .filter((m) => m.layout === "ready")
+        .map((m) => m.name ?? null),
+    );
+    for (const id of Object.keys(this.panels)) {
+      if (!live.has(id) && ready.has(machineOf(id))) delete this.panels[id];
+    }
+  }
 
-    if (space.id !== this.space) {
-      const isInitialSpace = this.space === undefined;
-      this.space = space.id;
+  // Remembers each tab's side panel across tab switches and restarts: whether
+  // it is open, its mode, and its size. A tab that has no saved panel starts
+  // with the panel closed. On startup, such a tab keeps the layout's panel.
+  syncPanel(tab, panel, now, enabled, applyPanel) {
+    if (!tab || !panel) return;
+
+    if (tab.id !== this.tab) {
+      const isInitialTab = this.tab === undefined;
+      this.tab = tab.id;
       this.pending = null;
+      this.prunePanels();
 
-      if (!isInitialSpace || Object.hasOwn(this.panels, space.id)) {
-        const raw = Object.hasOwn(this.panels, space.id)
-          ? (this.panels[space.id] ?? null)
-          : null;
-        // Migrate the legacy "review" mode name to "comments".
-        const stored =
-          raw === "review" && enabled.includes("comments") ? "comments" : raw;
-        const want = enabled.includes(stored) ? stored : null;
-        if (want !== activeMode) {
+      if (!isInitialTab || Object.hasOwn(this.panels, tab.id)) {
+        const saved = this.panels[tab.id] ?? {};
+        const mode = enabled.includes(saved.mode) ? saved.mode : null;
+        const want = { ...saved, mode };
+        if (!samePanel(want, now)) {
           this.pending = { want, until: Date.now() + 1000 };
-          applyMode(want);
+          applyPanel(want);
           return;
         }
       }
     }
 
-    // Ignore the previous space's panel state until the restore settles.
+    // Ignore the previous tab's panel state until the restore settles.
     if (this.pending) {
-      if (this.pending.want !== activeMode && Date.now() < this.pending.until) {
+      if (!samePanel(this.pending.want, now) && Date.now() < this.pending.until) {
         return;
       }
       this.pending = null;
     }
 
-    if (
-      Object.hasOwn(this.panels, space.id) &&
-      this.panels[space.id] === activeMode
-    ) {
-      return;
-    }
-    this.panels[space.id] = activeMode;
+    // A closed panel keeps the size that the tab saved while it was open.
+    const old = this.panels[tab.id];
+    const next = { mode: now.mode, sizes: now.mode ? now.sizes : old?.sizes };
+    if (JSON.stringify(old) === JSON.stringify(next)) return;
+    this.panels[tab.id] = next;
     try {
-      localStorage.setItem("panels", JSON.stringify(this.panels));
+      localStorage.setItem("tabPanels", JSON.stringify(this.panels));
     } catch {
       // Ignore storage write errors so rendering still succeeds.
     }
@@ -259,8 +310,10 @@ export class Tabs {
     const sidebar = findNode(root, "sidebar");
     const win = window();
     const lightsPadding = macosTrafficLightPadding(root, sidebar, win);
-    const { panel, enabled, activeMode, applyMode } = resolvePanelState(root);
-    this.syncPanel(space, panel, activeMode, enabled, applyMode);
+    const { panel, enabled, activeMode, sizes, applyMode, applyPanel } =
+      resolvePanelState(root);
+    const now = { mode: activeMode, sizes };
+    this.syncPanel(shown[activeIndex], panel, now, enabled, applyPanel);
 
     // Stop mouse-down propagation on interactive controls so a draggable
     // titlebar block (`window_drag: true`) does not start a window drag.

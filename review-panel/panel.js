@@ -77,6 +77,7 @@ import {
   pictureFile,
   tokenizeLine,
   formatMarkdown,
+  machineOf,
 } from "./model.js";
 import { Diagrams } from "./diagrams.js";
 import { Pictures, CACHE as PICTURES } from "./pictures.js";
@@ -306,6 +307,15 @@ export class Panel {
     this.pending = new Set();
     this.treeLimited = false;
     this.open = null;
+    // The file that each tab last showed, by tab id. The tab shows it again
+    // when the panel returns to that tab, and in Files and Changes alike.
+    this.kept = new Map();
+    // The folders that each tab had expanded in the file list, by tab id.
+    this.trees = new Map();
+    this.loadViews();
+    // The panel moved to another tab or folder, and the refresh has not yet
+    // read the changed files that decide whether Changes can show the file.
+    this.returning = false;
     this.rows = [];
     this.start = 0;
     this.ready = false;
@@ -447,6 +457,33 @@ export class Panel {
     localStorage.setItem("review.sets", JSON.stringify({ sets: this.sets }));
   }
 
+  // Reads the open file and the expanded folders that each tab saved.
+  loadViews() {
+    try {
+      const stored = JSON.parse(localStorage.getItem("review.views") ?? "null");
+      if (Array.isArray(stored?.kept)) this.kept = new Map(stored.kept);
+      if (Array.isArray(stored?.trees)) this.trees = new Map(stored.trees);
+    } catch {
+      // Ignore malformed saved state and start with nothing remembered.
+    }
+  }
+
+  // Records what the current tab shows, then saves every tab's open file and
+  // expanded folders so that they survive a restart.
+  saveViews() {
+    this.keepFile();
+    this.keepTree();
+    if (checking()) return;
+    try {
+      localStorage.setItem(
+        "review.views",
+        JSON.stringify({ kept: [...this.kept], trees: [...this.trees] }),
+      );
+    } catch {
+      // Ignore storage write errors. The tabs still remember until a restart.
+    }
+  }
+
   mine() {
     return this.root ? findSet(this.sets, this.tab, this.on, this.root) : undefined;
   }
@@ -500,6 +537,14 @@ export class Panel {
     const live = this.tabs();
     const tab = live.get(this.tab);
     this.names = tabNames(live);
+    // A machine that is not connected lists no tabs, so its tabs stay.
+    const gone = (id) => !live.has(id) && this.reachable(machineOf(id));
+    for (const id of this.kept.keys()) {
+      if (gone(id)) this.kept.delete(id);
+    }
+    for (const id of this.trees.keys()) {
+      if (gone(id)) this.trees.delete(id);
+    }
     let changed = sweep(
       this.sets,
       (id) => live.get(id),
@@ -638,6 +683,11 @@ export class Panel {
         this.tend();
         if (!root) return;
         if (repo) await this.loadChanges(context);
+        if (!this.current(context)) return;
+        if (this.returning) {
+          this.returning = false;
+          this.recall();
+        }
         if (this.mode === "files") {
           for (const path of ["", ...this.folders]) {
             if (!this.current(context)) return;
@@ -682,6 +732,16 @@ export class Panel {
     this.repo = repo;
     if (!moved && tab === this.tab) return;
     this.keepNote();
+    this.keepFile();
+    this.keepTree();
+    // The next tab last showed the file that is open now, so the file stays.
+    const next = this.kept.get(tab);
+    const stays =
+      !moved &&
+      Boolean(this.open) &&
+      next?.ctx === ctx &&
+      next.path === this.open.path;
+    if (!moved && !stays) this.shut();
     if (moved) {
       this.stopWatch();
       this.files = [];
@@ -706,6 +766,16 @@ export class Panel {
     this.status = null;
     this.unfolded = new Set();
     this.note.set_value(this.mine()?.note ?? "");
+    this.returning = !stays;
+    if (!stays) this.recall();
+    // The file list shows the folders that this tab had expanded here. A
+    // refresh lists the expanded folders that have no listing yet.
+    const tree = this.trees.get(tab);
+    this.folders = new Set(tree?.ctx === ctx ? tree.folders : []);
+    for (const path of [...this.entries.keys()]) {
+      if (path && !this.folders.has(path)) this.entries.delete(path);
+    }
+    this.saveViews();
   }
 
   // ---------------------------------------------------------------- the agent's replies
@@ -848,6 +918,7 @@ export class Panel {
       this.folders.add(path);
       this.fetchFolder(path, cx);
     }
+    this.saveViews();
     cx.notify();
   }
 
@@ -874,6 +945,7 @@ export class Panel {
     localStorage.setItem("mode", mode);
     setShared("review-panel.mode", mode);
     if (mode === "files") this.fetchFolder("", cx);
+    if (this.recall()) this.fetch(cx);
     cx.notify();
   }
 
@@ -1151,7 +1223,52 @@ export class Panel {
 
   // ---------------------------------------------------------------- the open file
 
+  // Remembers the open file for the current tab.
+  keepFile() {
+    if (!this.open) return;
+    this.kept.set(this.tab, {
+      ctx: this.ctx,
+      path: this.open.path,
+      view: this.open.view,
+      mdMode: this.mdMode,
+      commenting: this.commenting,
+      start: this.start,
+    });
+  }
+
+  // Remembers the expanded folders for the current tab.
+  keepTree() {
+    if (!this.ctx) return;
+    this.trees.set(this.tab, { ctx: this.ctx, folders: [...this.folders] });
+  }
+
+  // Opens the file that the current tab last showed in this folder. Files
+  // shows the file itself. Changes shows its diff, so the file must have
+  // changes. Comments has no file view, and the tab keeps the file for the
+  // other modes. The caller loads the file. Returns whether a file opened.
+  recall() {
+    const kept = this.kept.get(this.tab);
+    if (this.open || !kept || kept.ctx !== this.ctx) return false;
+    if (this.mode === "comments") return false;
+    const changed = this.files.some((f) => f.path === kept.path);
+    if (this.mode === "changes" && !changed) return false;
+    this.open = { path: kept.path, view: this.mode };
+    if (kept.view === this.mode) {
+      this.mdMode = kept.mdMode;
+      this.commenting = kept.commenting;
+      this.start = kept.start;
+    } else {
+      // The page and the view state belong to the mode that set them.
+      this.commenting = this.comments().some((c) => c.path === kept.path);
+    }
+    this.jump = "top";
+    return true;
+  }
+
+  // Closes the open file without forgetting it: `keepFile` records it first,
+  // so the tab can show it again. `closeFile` also forgets it.
   shut() {
+    this.keepFile();
     this.loadSeq += 1;
     this.saveTimer?.cancel();
     this.saveTimer = null;
@@ -1191,6 +1308,14 @@ export class Panel {
     this.mdMode = "rendered";
   }
 
+  // Closes the open file because the user closed it. The tab does not show it
+  // again.
+  closeFile() {
+    this.shut();
+    this.kept.delete(this.tab);
+    this.saveViews();
+  }
+
   show(path, view, cx, comment) {
     this.shut();
     const target = view === "changes" ? "changes" : "files";
@@ -1205,6 +1330,7 @@ export class Panel {
       Boolean(comment) || this.comments().some((c) => c.path === path);
     this.mdMode = "rendered";
     this.jump = comment ?? "top";
+    this.saveViews();
     this.fetch(cx);
     cx.notify();
   }
@@ -1350,7 +1476,7 @@ export class Panel {
 
   toggleFile(path, view, cx) {
     if (this.open?.path === path && this.open.view === view) {
-      this.shut();
+      this.closeFile();
       cx.notify();
     } else {
       this.show(path, view, cx);
@@ -2602,6 +2728,9 @@ export class Panel {
         if (this.open) this.shut();
         this.mode = wanted;
         localStorage.setItem("mode", wanted);
+        // After a switch to another tab, `place` opens that tab's file.
+        const here = this.location().tab === this.tab;
+        if (here && this.recall()) this.fetch(cx);
       }
     }
 
@@ -2610,8 +2739,9 @@ export class Panel {
     const needFiles =
       this.mode === "files" &&
       this.root &&
-      !this.entries.has("") &&
-      !this.pending.has("");
+      ["", ...this.folders].some(
+        (path) => !this.entries.has(path) && !this.pending.has(path),
+      );
     const stale = !this.loading && Date.now() - (this.at ?? 0) > STALE;
     if (
       shown() !== false &&
@@ -2817,7 +2947,7 @@ export class Panel {
             .text_color(t.muted)
             .hover((s) => s.text_color(t.foreground))
             .on_click((_e, cx) => {
-              this.shut();
+              this.closeFile();
               cx.notify();
             })
             .child("←"),

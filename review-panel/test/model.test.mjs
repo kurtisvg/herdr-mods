@@ -38,6 +38,9 @@ import {
   tokenizeLine,
   wrapMarkdown,
   formatMarkdown,
+  machineOf,
+  sameSize,
+  samePanel,
 } from "../model.js";
 
 const DIFF = [
@@ -1326,4 +1329,33 @@ test("formatMarkdown handles borderless tables, quoted tables, code fences, and 
   ].join("\n");
 
   assert.equal(formatMarkdown(input, 88), expected);
+});
+
+test("machineOf reads the machine from a tab id", () => {
+  assert.equal(machineOf("tb1"), null);
+  assert.equal(machineOf("devbox/tb1"), "devbox");
+});
+
+test("sameSize tolerates the precision that Herdr stores", () => {
+  assert.ok(sameSize({ weight: 1.0589168 }, { weight: 1.0589168071746826 }));
+  assert.ok(!sameSize({ weight: 1 }, { weight: 1.1 }));
+  assert.ok(sameSize({ px: 320 }, { px: 320.2 }));
+  assert.ok(!sameSize({ px: 320 }, { px: 400 }));
+  assert.ok(!sameSize({ px: 320 }, { weight: 1 }));
+  assert.ok(!sameSize({ px: 320 }, undefined));
+});
+
+test("samePanel compares the mode, and the sizes of an open panel", () => {
+  const sizes = { main: { weight: 1.2 }, panel: { weight: 0.8 } };
+  const wide = { main: { weight: 0.8 }, panel: { weight: 1.2 } };
+
+  assert.ok(samePanel({ mode: "files", sizes }, { mode: "files", sizes }));
+  assert.ok(!samePanel({ mode: "files", sizes }, { mode: "changes", sizes }));
+  assert.ok(!samePanel({ mode: "files", sizes }, { mode: "files", sizes: wide }));
+  // A tab that saved no sizes accepts the size that the panel has.
+  assert.ok(samePanel({ mode: "files" }, { mode: "files", sizes: wide }));
+  // A closed panel has no size to compare.
+  assert.ok(samePanel({ mode: null, sizes }, { mode: null, sizes: wide }));
+  assert.ok(samePanel({}, { mode: null, sizes }));
+  assert.ok(!samePanel({ mode: null }, { mode: "files", sizes }));
 });

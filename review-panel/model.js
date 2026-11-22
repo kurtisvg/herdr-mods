@@ -424,6 +424,29 @@ export function attach(sets, from, tab, on, root) {
   return from;
 }
 
+// ---------------------------------------------------------------- per-tab state
+
+// The machine of a tab id, or null for this computer. Ids on another machine
+// start with its name and a slash.
+export const machineOf = (id) => (id.includes("/") ? id.split("/")[0] : null);
+
+// Whether two layout sizes, `{ px }` or `{ weight }`, are the same size.
+// Herdr stores sizes with less precision than JSON numbers have.
+export const sameSize = (a, b) =>
+  Math.abs((a?.px ?? 0) - (b?.px ?? 0)) < 0.5 &&
+  Math.abs((a?.weight ?? 0) - (b?.weight ?? 0)) < 0.001;
+
+// Whether the side panel already shows what a tab saved. `saved` and `now`
+// are `{ mode, sizes }`: a null `mode` is a closed panel, and `sizes` maps
+// layout node ids to sizes. A closed panel has no size to compare.
+export function samePanel(saved, now) {
+  if ((saved.mode ?? null) !== now.mode) return false;
+  if (!saved.mode || !saved.sizes) return true;
+  return Object.keys(saved.sizes).every((id) =>
+    sameSize(saved.sizes[id], now.sizes[id]),
+  );
+}
+
 // ---------------------------------------------------------------- markdown
 
 export const isMarkdown = (path) => /\.(md|markdown|mdx)$/i.test(path ?? "");
