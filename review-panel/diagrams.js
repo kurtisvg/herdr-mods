@@ -1,30 +1,23 @@
 // Renders Mermaid diagrams to PNG files in `~/.config/herdr-app/cache/review-panel/`
-// via `renderer/render.mjs`, keyed by diagram source and light/dark theme.
-// When the renderer or its npm packages are not installed, `render()` sets
-// `missingRenderer` and `get()` returns undefined, so callers can show why.
+// via `renderer/render.mjs`, keyed by diagram source, active Herdr theme vars,
+// and UI font. Keeps returning the previous rendered image while a redraw is in
+// flight so callers never collapse a visible diagram into a spinner box.
 
-import { exec, appHome, settings } from "herdr";
+import { exec, appHome, settings, theme, checking } from "herdr";
 import * as fs from "fs/promises";
+import {
+  hashText,
+  diagramFont,
+  diagramThemeVars,
+  diagramThemeSignature,
+  resolveDiagramEntry,
+} from "./diagram.js";
 
 export const CACHE = "cache/review-panel";
-const RENDERER = 1; // bump when render.mjs output changes
+const RENDERER = 2; // bump when render.mjs output changes
 const SCALE = 2; // PNG device pixels per layout pixel
 const rendererDir = () => `${appHome()}/mods/review-panel/renderer`;
 const script = () => `${rendererDir()}/render.mjs`;
-
-// cyrb53: short stable content key for diagram text.
-function hash(text) {
-  let a = 0xdeadbeef;
-  let b = 0x41c6ce57;
-  for (let i = 0; i < text.length; i++) {
-    const c = text.charCodeAt(i);
-    a = Math.imul(a ^ c, 2654435761);
-    b = Math.imul(b ^ c, 1597334677);
-  }
-  a = Math.imul(a ^ (a >>> 16), 2246822507) ^ Math.imul(b ^ (b >>> 13), 3266489909);
-  b = Math.imul(b ^ (b >>> 16), 2246822507) ^ Math.imul(a ^ (a >>> 13), 3266489909);
-  return (4294967296 * (2097151 & b) + (a >>> 0)).toString(16).padStart(14, "0");
-}
 
 // Reads a PNG's pixel size from its header, or null if absent or invalid.
 async function pngSize(path) {
@@ -66,21 +59,58 @@ async function isRendererInstalled() {
 export class Diagrams {
   constructor() {
     this.known = new Map(); // id -> { pending } | { path, width, height } | { error }
+    this.lastByCode = new Map(); // codeHash -> { path, width, height }
+    this.lastBySlot = new Map(); // slotKey -> { path, width, height }
     this.missingRenderer = false;
   }
 
-  id(code, dark = Boolean(settings().dark)) {
-    return `${hash(code)}-${dark ? "d" : "l"}${RENDERER}`;
+  currentSpec() {
+    const s = settings();
+    const dark = Boolean(s?.dark);
+    const vars = diagramThemeVars(theme());
+    const font = diagramFont(s);
+    const sig = diagramThemeSignature(dark, vars, font);
+    return { dark, vars, font, sig };
   }
 
-  // Returns undefined, `{ pending }`, `{ path, width, height }`, or `{ error }`.
-  get(code) {
-    return this.known.get(this.id(code));
+  signature() {
+    return this.currentSpec().sig;
+  }
+
+  id(code, spec = this.currentSpec()) {
+    return `${hashText(code)}-${spec.dark ? "d" : "l"}-${spec.sig}-${RENDERER}`;
+  }
+
+  evictPath(path) {
+    for (const [key, entry] of this.lastByCode) {
+      if (entry.path === path) this.lastByCode.delete(key);
+    }
+    for (const [key, entry] of this.lastBySlot) {
+      if (entry.path === path) this.lastBySlot.delete(key);
+    }
+  }
+
+  // Returns undefined, `{ pending }`, `{ path, width, height, refreshing? }`,
+  // or `{ error }`. When a redraw is in flight for a previously drawn diagram
+  // (by source hash or optional `slotKey`), keeps returning the previous image
+  // with `refreshing: true`.
+  get(code, slotKey = null) {
+    const current = this.known.get(this.id(code));
+    if (current?.path) {
+      if (slotKey) this.lastBySlot.set(slotKey, current);
+      return current;
+    }
+    if (this.missingRenderer) return current;
+    const previous =
+      this.lastByCode.get(hashText(code)) ??
+      (slotKey ? this.lastBySlot.get(slotKey) : undefined);
+    return resolveDiagramEntry(current, previous);
   }
 
   // Ensures every non-empty Mermaid block in `codes` has a cached PNG for the
-  // active theme, batching uncached blocks into one `render.mjs` invocation.
+  // active theme and font, batching uncached blocks into one `render.mjs` call.
   async draw(codes, cx) {
+    if (checking()) return;
     if (this.busy) {
       this.queued = { codes, cx };
       return;
@@ -91,21 +121,22 @@ export class Diagrams {
       while (next) {
         const { codes: batch, cx: batchCx } = next;
         next = null;
-        const dark = Boolean(settings().dark);
+        const spec = this.currentSpec();
         const wanted = new Map();
         for (const code of batch) {
           if (!code?.trim()) continue;
-          const id = this.id(code, dark);
+          const id = this.id(code, spec);
           const have = this.known.get(id);
           if (
             have?.path &&
             !(await fs.exists(`${appHome()}/${have.path}`).catch(() => false))
           ) {
             this.known.delete(id);
+            this.evictPath(have.path);
           }
           if (!this.known.has(id)) wanted.set(id, code);
         }
-        if (wanted.size) await this.render(wanted, dark, batchCx);
+        if (wanted.size) await this.render(wanted, spec, batchCx);
         if (this.queued) {
           next = this.queued;
           this.queued = null;
@@ -116,7 +147,7 @@ export class Diagrams {
     }
   }
 
-  async render(wanted, dark, cx) {
+  async render(wanted, spec, cx) {
     const installed = await isRendererInstalled();
     this.missingRenderer = !installed;
     if (!installed) {
@@ -126,16 +157,20 @@ export class Diagrams {
 
     const out = `${appHome()}/${CACHE}`;
     const todo = [];
+    const codeById = new Map();
     for (const [id, code] of wanted) {
       const size = await pngSize(`${out}/${id}.png`);
       if (size) {
-        this.known.set(id, {
+        const entry = {
           path: `${CACHE}/${id}.png`,
           width: size.width / SCALE,
           height: size.height / SCALE,
-        });
+        };
+        this.known.set(id, entry);
+        this.lastByCode.set(hashText(code), entry);
       } else {
         this.known.set(id, { pending: true });
+        codeById.set(id, code);
         todo.push({ id, code });
       }
     }
@@ -145,10 +180,20 @@ export class Diagrams {
     const fail = (message) => {
       for (const item of todo) this.known.set(item.id, { error: message });
     };
-    const job = `${out}/job-${Date.now()}-${hash(todo.map((i) => i.id).join())}.json`;
+    const job = `${out}/job-${Date.now()}-${hashText(todo.map((i) => i.id).join())}.json`;
     try {
       await fs.mkdir(out, { recursive: true });
-      await fs.writeFile(job, JSON.stringify({ out, dark, scale: SCALE, items: todo }));
+      await fs.writeFile(
+        job,
+        JSON.stringify({
+          out,
+          dark: spec.dark,
+          scale: SCALE,
+          vars: spec.vars,
+          font: spec.font,
+          items: todo,
+        }),
+      );
       const r = await exec("node", [script(), job], { timeout: 120000 });
       let reply = null;
       try {
@@ -164,16 +209,18 @@ export class Diagrams {
       } else {
         fail("the renderer returned nothing for this diagram");
         for (const item of reply.results ?? []) {
-          this.known.set(
-            item.id,
-            item.ok
-              ? {
-                  path: `${CACHE}/${item.id}.png`,
-                  width: item.width,
-                  height: item.height,
-                }
-              : { error: item.error },
-          );
+          if (item.ok) {
+            const entry = {
+              path: `${CACHE}/${item.id}.png`,
+              width: item.width,
+              height: item.height,
+            };
+            this.known.set(item.id, entry);
+            const code = codeById.get(item.id);
+            if (code) this.lastByCode.set(hashText(code), entry);
+          } else {
+            this.known.set(item.id, { error: item.error });
+          }
         }
       }
     } catch (e) {

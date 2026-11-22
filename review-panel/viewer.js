@@ -257,7 +257,10 @@ export class Viewer {
     this.open(target.path, this.on, cx, false, target.lines);
   }
 
-  render() {
+  render(cx) {
+    if (!checking() && this.doc.consumeThemeRedraw()) {
+      cx.spawn((cx) => this.doc.draw(cx));
+    }
     const t = theme();
     const name = this.file?.split("/").pop() ?? "Markdown";
     const pending = this.doc.pending();

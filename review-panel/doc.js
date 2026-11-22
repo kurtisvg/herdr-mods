@@ -6,6 +6,7 @@ import { v_flex, h_flex, TextView } from "gpui-base";
 import { settings } from "herdr";
 import { splitMarkdown, pictureFile } from "./model.js";
 import { CACHE } from "./pictures.js";
+import { DiagramViews } from "./diagram-view.js";
 
 const PAGE = 920; // maximum text-column width in pixels
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -128,24 +129,46 @@ export class MarkdownDoc {
     this.name = name;
     this.pictures = pictures;
     this.diagrams = diagrams;
+    this.file = file;
     this.dir =
       file && file.includes("/") ? file.replace(/\/[^/]*$/, "") || "/" : null;
     this.on = on;
     this.text = null;
+    this.themeSig = null;
     this.segments = [];
     this.frontmatterOpen = true;
+    this.diagramViews = new DiagramViews();
   }
 
-  // Updates the document text and theme. Returns true when segments changed.
+  hasMermaid() {
+    return this.segments.some((s) => s.kind === "mermaid" && s.code.trim());
+  }
+
+  // Updates the document text and active theme signature. Returns true when
+  // segments or theme changed and a draw pass is needed.
   set(text) {
-    const dark = Boolean(settings().dark);
-    if (text === this.text && dark === this.dark) return false;
+    const sig = this.diagrams.signature();
+    if (text === this.text) {
+      if (sig === this.themeSig) return false;
+      this.themeSig = sig;
+      return this.hasMermaid();
+    }
     this.text = text;
-    this.dark = dark;
+    this.themeSig = sig;
     this.segments = splitMarkdown(text, (src) =>
       this.on ? null : pictureFile(src, this.dir),
     );
     return true;
+  }
+
+  // Updates `themeSig` when the active theme changed and reports whether this
+  // document has Mermaid diagrams that need a redraw.
+  consumeThemeRedraw() {
+    if (this.text === null) return false;
+    const sig = this.diagrams.signature();
+    if (sig === this.themeSig) return false;
+    this.themeSig = sig;
+    return this.hasMermaid();
   }
 
   pending() {
@@ -171,13 +194,14 @@ export class MarkdownDoc {
 
   async draw(cx) {
     await this.refresh(cx);
+    this.themeSig = this.diagrams.signature();
     const codes = this.segments
       .filter((s) => s.kind === "mermaid" && s.code.trim())
       .map((s) => s.code);
     if (codes.length) await this.diagrams.draw(codes, cx);
   }
 
-  diagram(s, t, room) {
+  diagram(s, slot, t, room) {
     const box = () =>
       v_flex()
         .w_full()
@@ -201,7 +225,8 @@ export class MarkdownDoc {
         )
         .child(div().text_color(t.muted).child("This mermaid block is empty."));
     }
-    const d = this.diagrams.get(s.code);
+    const slotKey = `${this.name}:${this.on ?? ""}:${this.file ?? ""}#${slot}`;
+    const d = this.diagrams.get(s.code, slotKey);
     if (!d && this.diagrams.missingRenderer) {
       return box()
         .border_color(t.blocked)
@@ -220,17 +245,7 @@ export class MarkdownDoc {
         )
         .child(div().font_family(mono).text_size(11.5).text_color(t.muted).child(s.code));
     }
-    if (!d || d.pending) {
-      return box().child(
-        h_flex()
-          .gap(8)
-          .items_center()
-          .text_color(t.muted)
-          .child(div().w(12).frames(SPINNER, 90))
-          .child("Drawing diagram…"),
-      );
-    }
-    if (d.error) {
+    if (d?.error) {
       const heading = s.open
         ? "This mermaid block is never closed"
         : "This diagram could not be drawn";
@@ -240,16 +255,33 @@ export class MarkdownDoc {
         .child(div().text_color(t.muted).child(d.error))
         .child(div().font_family(mono).text_size(11.5).text_color(t.muted).child(s.code));
     }
-    const k = Math.min(1, room / d.width);
+    if (!d?.path) {
+      return box().child(
+        h_flex()
+          .gap(8)
+          .items_center()
+          .text_color(t.muted)
+          .child(div().w(12).frames(SPINNER, 90))
+          .child("Drawing diagram…"),
+      );
+    }
+
+    const fileName = this.file?.split("/").pop();
+    const title = fileName ? `${fileName} — Diagram ${slot + 1}` : `Diagram ${slot + 1}`;
     return h_flex()
       .w_full()
       .justify_center()
       .py(6)
       .child(
-        image(d.path)
-          .w(Math.round(d.width * k))
-          .h(Math.round(d.height * k))
-          .flex_none(),
+        this.diagramViews.renderCard({
+          id: `${this.name}-diagram-${slot}`,
+          key: `slot-${slot}`,
+          diagram: d,
+          theme: t,
+          width: room,
+          expandable: true,
+          title,
+        }),
       );
   }
 
@@ -293,6 +325,7 @@ export class MarkdownDoc {
   element(t, width, link) {
     const pad = (width ?? PAGE) < 560 ? 16 : 28;
     const room = Math.max(120, Math.min(PAGE, width ?? PAGE) - pad * 2 - 12);
+    let diagramSlot = 0;
     return div()
       .id(`${this.name}-scroll`)
       .flex_1()
@@ -330,7 +363,7 @@ export class MarkdownDoc {
                   );
               }
               if (s.kind === "pictures") return this.row(s, i, t, room, link);
-              return this.diagram(s, t, room);
+              return this.diagram(s, diagramSlot++, t, room);
             }),
           ),
       );
