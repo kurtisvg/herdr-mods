@@ -39,6 +39,7 @@ JETSKI_SHOWN = re.compile(
     + rb")?[ \r\n(]"
 )
 JETSKI_LOG = re.compile(r"/cli/log/[^/]+\.log$")
+JETSKI_LOCK = re.compile("(" + UUID.decode() + r")\.lock")
 CHUNK = 512 * 1024
 OVERLAP = 512
 MAX_SCAN = 64 * 1024 * 1024
@@ -184,6 +185,24 @@ def jetski_shown_conversation(log_path):
     return None
 
 
+def jetski_locked_conversation(proc, app_dir):
+    """Return the conversation ID that a Jetski process holds a presence lock for.
+
+    Jetski names its log after the second in which it started, so processes that
+    start together write one log. That log then names the same conversation for all
+    of them. The presence lock belongs to one process. Return None when the process
+    holds no lock, as older Jetski versions do, or holds more than one.
+    """
+    prefix = app_dir + "/presence/"
+    locked = {
+        match.group(1)
+        for path in proc["written"]
+        if path.startswith(prefix)
+        and (match := JETSKI_LOCK.fullmatch(path[len(prefix):])) is not None
+    }
+    return locked.pop() if len(locked) == 1 else None
+
+
 def jetski_describe(db_path, cid, db_cache):
     """Resolve a Jetski conversation ID to its root conversation ID and title."""
     con = get_db(db_path, db_cache)
@@ -218,17 +237,20 @@ def resolve_jetski(proc, db_cache):
     """Detect a Jetski CLI process from its open log file and resolve its session.
 
     Jetski writes its log. A program that only reads the log, such as `tail`, is not
-    Jetski.
+    Jetski. The presence lock names the conversation. The log names it for a Jetski
+    version that holds no lock.
     """
     log_path = next((path for path in proc["written"] if JETSKI_LOG.search(path)), None)
     if not log_path:
         return None
 
-    cid = jetski_shown_conversation(log_path)
+    app_dir = log_path[: log_path.rindex("/cli/log/")]
+    cid = jetski_locked_conversation(proc, app_dir)
+    if not cid:
+        cid = jetski_shown_conversation(log_path)
     if not cid:
         return {"harness": "jetski", "id": None, "title": ""}
 
-    app_dir = log_path[: log_path.rindex("/cli/log/")]
     db_path = os.path.join(app_dir, "conversation_summaries.db")
     root_id, title = jetski_describe(db_path, cid, db_cache)
     return {"harness": "jetski", "id": root_id, "title": title}
