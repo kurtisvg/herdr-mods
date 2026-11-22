@@ -75,6 +75,7 @@ import {
   blockFor,
   textKey,
   pictureFile,
+  editorLanguage,
   tokenizeLine,
   formatMarkdown,
   machineOf,
@@ -101,25 +102,6 @@ const READ = [
   "-c",
   "diff.autoRefreshIndex=false",
 ];
-
-const LANG = {
-  ts: "js",
-  tsx: "js",
-  mts: "js",
-  cts: "js",
-  jsx: "js",
-  mjs: "js",
-  cjs: "js",
-  pyi: "py",
-  toml: "yaml",
-  jsonc: "json",
-  svelte: "html",
-  vue: "html",
-  sh: "bash",
-  zsh: "bash",
-  markdown: "md",
-  mdx: "md",
-};
 
 function findNode(node, id) {
   if (node?.id === id) return node;
@@ -1178,7 +1160,6 @@ export class Panel {
     }
     this.editor?.release();
     const t = theme();
-    const ext = path.includes(".") ? path.split(".").pop().toLowerCase() : "txt";
     this.saveSeq += 1;
     this.editorFocused = false;
     this.canEdit = Boolean(editable) && !checking();
@@ -1192,7 +1173,7 @@ export class Panel {
     this.conflictDisk = null;
     this.saveError = null;
     this.editor = EditorState.new({
-      language: LANG[ext] ?? ext,
+      language: editorLanguage(path),
       readonly: !this.canEdit,
       soft_wrap: isMarkdown(path),
       value: text,
@@ -1206,6 +1187,11 @@ export class Panel {
         type: t.ansi3,
         number: t.ansi1,
         constant: t.ansi6,
+        variable: t.foreground,
+        operator: t.muted,
+        punctuation: t.muted,
+        boolean: t.ansi6,
+        "string.escape": t.ansi6,
       },
     });
     this.editor.on("focus", () => {
