@@ -387,8 +387,10 @@ export default class Spaces extends View {
     this.scroll = ScrollHandle.new();
     // Active item's index among direct list children (headers and rows), or -1.
     this.activeAt = -1;
+    // Key of the active item that was last scrolled into view.
     this.revealed = null;
-    this.revealedAt = -1;
+    // Height of the list at its last layout, used to detect when the list shrinks.
+    this.listHeight = 0;
     this.machines = [];
     this.reconnecting = readReconnecting();
     this.folded = readStoredSet("machines.folded");
@@ -1739,15 +1741,16 @@ export default class Spaces extends View {
       shownAddress,
     );
 
-    // Scroll the active space, tab, or subagent into view when it or its position changes.
-    // A row already visible stays put.
+    // Scroll the active space, tab, or subagent into view when a different item
+    // becomes active. A row already visible stays put, and a hidden row waits until
+    // it is drawn. Do not scroll when only the row's position changes, for example
+    // when a subagent starts above it. That would undo the user's own scrolling.
     const activeSpace = allSpaces.find((space) => space.active);
     const activeTab = activeSpace?.tabs?.find((tab) => tab.active);
     const active = `${activeSpace?.id ?? ""}:${activeTab?.id ?? ""}:${shownAddress ?? ""}`;
-    if (active !== this.revealed || this.activeAt !== this.revealedAt) {
+    if (active !== this.revealed && this.activeAt >= 0) {
       this.revealed = active;
-      this.revealedAt = this.activeAt;
-      if (this.activeAt >= 0) this.scroll.scroll_to_item(this.activeAt);
+      this.scroll.scroll_to_item(this.activeAt);
     }
 
     return v_flex()
@@ -1791,9 +1794,13 @@ export default class Spaces extends View {
           .overflow_y_scrollbar()
           .mode("always")
           .track_scroll(this.scroll)
-          // Another mod growing above, or the window resizing, can push the active row out.
-          .on_size_change((_size, cx) => {
-            if (this.activeAt >= 0) {
+          // Another mod growing above, or the window resizing, can shrink the list
+          // and push the active row out. Herdr also calls this handler when the size
+          // is unchanged. Scrolling then would undo the user's own scrolling.
+          .on_size_change((size, cx) => {
+            const shrank = size.height < this.listHeight;
+            this.listHeight = size.height;
+            if (shrank && this.activeAt >= 0) {
               this.scroll.scroll_to_item(this.activeAt);
               cx.notify();
             }
