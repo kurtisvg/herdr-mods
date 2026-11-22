@@ -35,6 +35,7 @@ import {
   pictureFile,
   liftPictures,
   splitMarkdown,
+  editorLanguage,
   tokenizeLine,
   wrapMarkdown,
   formatMarkdown,
@@ -1358,4 +1359,34 @@ test("samePanel compares the mode, and the sizes of an open panel", () => {
   assert.ok(samePanel({ mode: null, sizes }, { mode: null, sizes: wide }));
   assert.ok(samePanel({}, { mode: null, sizes }));
   assert.ok(!samePanel({ mode: null }, { mode: "files", sizes }));
+});
+
+test("editorLanguage maps extensions, special filenames, and edge-case paths", () => {
+  const cases = [
+    ["ts alias", "src/app.ts", "js"],
+    ["tsx alias uppercase", "src/App.TSX", "js"],
+    ["mjs alias", "scripts/build.mjs", "js"],
+    ["jsonc alias", ".vscode/settings.jsonc", "json"],
+    ["toml alias", "Cargo.toml", "yaml"],
+    ["scss alias", "styles/theme.scss", "css"],
+    ["zsh alias", "scripts/env.zsh", "bash"],
+    ["windows path", "scripts\\env.zsh", "bash"],
+    ["native python", "app.py", "py"],
+    ["native pyi", "types.pyi", "pyi"],
+    ["native rust", "src/lib.rs", "rs"],
+    ["native go", "cmd/main.go", "go"],
+    ["native sh", "bin/run.sh", "sh"],
+    ["makefile without extension", "dir.v1/Makefile", "makefile"],
+    ["shell dotfile", "home/.zshrc", "bash"],
+    ["unknown dotfile", ".gitignore", "txt"],
+    ["extensionless file under dotted dir", "dir.v1/README", "txt"],
+    ["trailing dot", "file.", "txt"],
+    ["empty path", "", "txt"],
+    ["prototype property filename", "constructor", "txt"],
+    ["prototype property extension", "file.constructor", "constructor"],
+  ];
+
+  for (const [name, path, expected] of cases) {
+    assert.equal(editorLanguage(path), expected, name);
+  }
 });

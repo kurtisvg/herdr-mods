@@ -1477,6 +1477,55 @@ export function formatMarkdown(text, width = 88) {
   return reflowMarkdown(text, width, true);
 }
 
+// ---------------------------------------------------------------- editor highlighting
+//
+// Maps file paths onto EditorState's `language` option. Only extensions that
+// EditorState does not highlight under their own name are aliased here
+// (verified live in Herdr: js/javascript, py/python/pyi, rs/rust, go, json,
+// bash/sh, yaml/yml, css, sql, c/h, cpp/hpp/cc/cxx/hh/hxx, java, rb/ruby, cs,
+// php, lua, makefile/make/mk, perl/pl, scala, haskell/hs, ocaml/ml/mli, r,
+// clj, erl, tex, bat, groovy, lisp/el, and tcl highlight natively; markdown/md
+// and html/xml do not).
+
+const EDITOR_LANG = {
+  ts: "js",
+  tsx: "js",
+  mts: "js",
+  cts: "js",
+  jsx: "js",
+  mjs: "js",
+  cjs: "js",
+  jsonc: "json",
+  toml: "yaml",
+  scss: "css",
+  sass: "css",
+  less: "css",
+  zsh: "bash",
+  ksh: "bash",
+  shell: "bash",
+};
+
+const EDITOR_FILES = {
+  makefile: "makefile",
+  gnumakefile: "makefile",
+  ".bashrc": "bash",
+  ".bash_profile": "bash",
+  ".zshrc": "bash",
+  ".zprofile": "bash",
+  ".profile": "bash",
+};
+
+// Resolves a file path to the EditorState language name that best highlights it.
+export function editorLanguage(path) {
+  if (!path) return "txt";
+  const base = path.split(/[\\/]/).pop().toLowerCase();
+  if (Object.hasOwn(EDITOR_FILES, base)) return EDITOR_FILES[base];
+  const dot = base.lastIndexOf(".");
+  if (dot <= 0 || dot === base.length - 1) return "txt";
+  const ext = base.slice(dot + 1);
+  return Object.hasOwn(EDITOR_LANG, ext) ? EDITOR_LANG[ext] : ext;
+}
+
 // ---------------------------------------------------------------- line syntax coloring
 //
 // Tokenizes one line of code into `[[text, kind], ...]` runs for Comment mode
