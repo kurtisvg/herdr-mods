@@ -779,6 +779,67 @@ export function blockFor(blocks, line) {
 
 // ---------------------------------------------------------------- pictures and viewer segments
 
+function normalizePath(path) {
+  if (typeof path !== "string" || !path.startsWith("/")) return null;
+  const parts = [];
+  for (const part of path.split("/")) {
+    if (part === "..") parts.pop();
+    else if (part && part !== ".") parts.push(part);
+  }
+  return "/" + parts.join("/");
+}
+
+// Returns the normalized parent folder to pass to `watchFolder` for an
+// absolute file path, or null when the path has no watchable parent.
+export function watchDir(file) {
+  const clean = normalizePath(file);
+  if (!clean || clean === "/") return null;
+  return clean.replace(/\/[^/]*$/, "") || "/";
+}
+
+// Reports whether a `watchFolder(dir)` batch touches `dir` itself (a
+// bounded-queue full refresh) or any tracked file in `targets`.
+export function watchBatchMatches(paths, dir, targets) {
+  if (!Array.isArray(paths) || !paths.length) return false;
+  const root = normalizePath(dir);
+  if (!root) return false;
+  const prefix = root === "/" ? "/" : `${root}/`;
+
+  const tracked = new Set();
+  const symlinkSuffixes = root === "/" ? [] : [`/${root.split("/").pop()}`];
+  for (const raw of targets ?? []) {
+    const target = normalizePath(raw);
+    if (!target) continue;
+    tracked.add(target);
+    if (target.startsWith(prefix)) {
+      symlinkSuffixes.push(`/${target.slice(prefix.length)}`);
+    }
+  }
+  if (!tracked.size) return false;
+  const trackedList = [...tracked];
+
+  for (const raw of paths) {
+    const path = normalizePath(raw);
+    if (!path) continue;
+    if (path === root || tracked.has(path)) return true;
+
+    // An ancestor directory event (e.g. a renamed picture folder) can affect
+    // tracked files inside it.
+    const dirPrefix = path === "/" ? "/" : `${path}/`;
+    if (trackedList.some((target) => target.startsWith(dirPrefix))) return true;
+
+    // On macOS or symlinked roots (e.g. `/tmp` -> `/private/tmp`), FSEvents
+    // may report canonical paths outside `prefix`; match by relative suffix.
+    if (
+      !path.startsWith(prefix) &&
+      symlinkSuffixes.some((suffix) => path.endsWith(suffix))
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // Resolves a local path or `file://` URL `src` against folder `dir`, returning
 // a normalized `/...` path or null for web URLs, custom schemes, empty anchors,
 // or relative paths without `dir`.
@@ -802,12 +863,7 @@ export function pictureFile(src, dir) {
     if (!dir) return null;
     s = `${dir}/${s}`;
   }
-  const parts = [];
-  for (const part of s.split("/")) {
-    if (part === "..") parts.pop();
-    else if (part && part !== ".") parts.push(part);
-  }
-  return "/" + parts.join("/");
+  return normalizePath(s);
 }
 
 const DEST = String.raw`<[^>]*>|(?:\\.|[^\s()\\]|\((?:\\.|[^\s()\\])*\))+`;

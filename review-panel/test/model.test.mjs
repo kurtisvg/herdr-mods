@@ -33,6 +33,8 @@ import {
   blockFor,
   textKey,
   pictureFile,
+  watchDir,
+  watchBatchMatches,
   liftPictures,
   splitMarkdown,
   editorLanguage,
@@ -1474,4 +1476,55 @@ test("wrapSpans handles hard breaks, indentation, surrogates, and empty spans", 
   for (const { name, spans, maxCols, expected } of cases) {
     assert.deepEqual(wrapSpans(spans, maxCols), expected, name);
   }
+});
+
+test("watchDir returns the normalized parent folder for an absolute file", () => {
+  assert.equal(watchDir("/Users/kvg/repo/README.md"), "/Users/kvg/repo");
+  assert.equal(watchDir("/Users/kvg/a/../b/doc.md"), "/Users/kvg/b");
+  assert.equal(watchDir("/README.md"), "/");
+  assert.equal(watchDir("/"), null);
+  assert.equal(watchDir("notes.md"), null);
+  assert.equal(watchDir(""), null);
+  assert.equal(watchDir(null), null);
+});
+
+test("watchBatchMatches matches tracked files, root refreshes, and ancestor folders", () => {
+  const dir = "/Users/kvg/repo";
+  const targets = ["/Users/kvg/repo/README.md", "/Users/kvg/repo/images/arch.png"];
+
+  // Direct file and picture matches.
+  assert.ok(watchBatchMatches(["/Users/kvg/repo/README.md"], dir, targets));
+  assert.ok(watchBatchMatches(["/Users/kvg/repo/images/arch.png"], dir, targets));
+
+  // Root refresh (bounded queue overflow).
+  assert.ok(watchBatchMatches(["/Users/kvg/repo"], dir, targets));
+  assert.ok(watchBatchMatches(["/Users/kvg/repo/"], dir, targets));
+
+  // Ancestor folder of a tracked picture.
+  assert.ok(watchBatchMatches(["/Users/kvg/repo/images"], dir, targets));
+
+  // Unrelated files and sibling directories do not match.
+  assert.ok(!watchBatchMatches(["/Users/kvg/repo/src/index.js"], dir, targets));
+  assert.ok(!watchBatchMatches(["/Users/kvg/repo/README.md.swp"], dir, targets));
+  assert.ok(!watchBatchMatches(["/Users/kvg/repo/other/README.md"], dir, targets));
+  assert.ok(!watchBatchMatches(["/Users/kvg/repo/images2"], dir, targets));
+
+  // Empty or invalid inputs do not match.
+  assert.ok(!watchBatchMatches([], dir, targets));
+  assert.ok(!watchBatchMatches(["/Users/kvg/repo/README.md"], null, targets));
+  assert.ok(!watchBatchMatches(["/Users/kvg/repo/README.md"], dir, []));
+});
+
+test("watchBatchMatches handles canonical paths from symlinked roots", () => {
+  const targets = ["/tmp/notes.md", "/tmp/img/a.png"];
+  assert.ok(watchBatchMatches(["/private/tmp/notes.md"], "/tmp", targets));
+  assert.ok(watchBatchMatches(["/private/tmp/img/a.png"], "/tmp", targets));
+  assert.ok(watchBatchMatches(["/private/tmp"], "/tmp", targets));
+  assert.ok(!watchBatchMatches(["/private/tmp/other.txt"], "/tmp", targets));
+});
+
+test("watchBatchMatches handles files at the filesystem root", () => {
+  assert.ok(watchBatchMatches(["/"], "/", ["/README.md"]));
+  assert.ok(watchBatchMatches(["/README.md"], "/", ["/README.md"]));
+  assert.ok(!watchBatchMatches(["/other.md"], "/", ["/README.md"]));
 });
