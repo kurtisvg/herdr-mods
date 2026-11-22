@@ -4,16 +4,31 @@
 // and polls remote files.
 
 import { div } from "gpui-kit";
-import { v_flex, h_flex, InputState, Input } from "gpui-base";
+import {
+  v_flex,
+  h_flex,
+  InputState,
+  Input,
+  EditorState,
+  Editor,
+} from "gpui-base";
 import {
   props,
   readTextFile,
   theme,
+  settings,
   spaces,
   checking,
   watchFolder,
 } from "herdr";
-import { isMarkdown, watchDir, watchBatchMatches } from "./model.js";
+import {
+  isMarkdown,
+  editorLanguage,
+  resolveLink,
+  lineRangeOffsets,
+  watchDir,
+  watchBatchMatches,
+} from "./model.js";
 import { MarkdownDoc } from "./doc.js";
 import { Pictures } from "./pictures.js";
 import { Diagrams } from "./diagrams.js";
@@ -26,6 +41,9 @@ export class Viewer {
     this.diagrams = new Diagrams();
     this.doc = new MarkdownDoc("mv", this.pictures, this.diagrams);
     this.history = [];
+    this.editor = null;
+    this.text = null;
+    this.lines = null;
     this.size = null;
     this.watched = null;
     this.folderWatch = null;
@@ -53,6 +71,8 @@ export class Viewer {
 
   close() {
     this.stopWatch();
+    this.editor?.release();
+    this.editor = null;
   }
 
   stopWatch() {
@@ -106,7 +126,11 @@ export class Viewer {
     });
   }
 
-  show(file, on, cx) {
+  show(file, on, cx, lines = null) {
+    this.editor?.release();
+    this.editor = null;
+    this.text = null;
+    this.lines = lines;
     this.file = file;
     this.on = on ?? null;
     this.error = null;
@@ -117,7 +141,7 @@ export class Viewer {
     cx.notify();
   }
 
-  open(file, on, cx, first) {
+  open(file, on, cx, first, lines = null) {
     if (!first && this.file) {
       this.history.push({ file: this.file, on: this.on });
     }
@@ -127,13 +151,49 @@ export class Viewer {
         JSON.stringify({ file, on: on ?? null }),
       );
     }
-    this.show(file, on, cx);
+    this.show(file, on, cx, lines);
   }
 
   back(cx) {
     const last = this.history.pop();
     if (!last) return;
     this.show(last.file, last.on, cx);
+  }
+
+  syncEditor(file, text) {
+    if (text.includes("\0")) {
+      this.error = "Binary file.";
+      return;
+    }
+    this.error = null;
+    if (!this.editor) {
+      const t = theme();
+      this.editor = EditorState.new({
+        language: editorLanguage(file),
+        readonly: true,
+        soft_wrap: false,
+        value: text,
+        font_family: settings().font_family,
+        font_size: 12,
+        syntax: {
+          keyword: t.ansi5,
+          string: t.ansi2,
+          comment: t.dim,
+          function: t.ansi4,
+          type: t.ansi3,
+          number: t.ansi1,
+          constant: t.ansi6,
+        },
+      });
+    } else if (text !== this.text) {
+      this.editor.set_value(text);
+    }
+    this.text = text;
+    if (this.lines) {
+      const range = lineRangeOffsets(text, this.lines.from, this.lines.to);
+      this.editor.set_selected_range(range);
+      this.lines = null;
+    }
   }
 
   load(cx) {
@@ -152,7 +212,13 @@ export class Viewer {
         const text = await readTextFile(file, { on });
         if (this.doc !== doc) return;
         if (text === null) {
-          if (doc.text === null) this.error = "This file isn't there.";
+          if (doc.text === null && this.text === null) {
+            this.error = "This file isn't there.";
+          }
+          return;
+        }
+        if (!isMarkdown(file)) {
+          this.syncEditor(file, text);
           return;
         }
         this.error = null;
@@ -163,7 +229,7 @@ export class Viewer {
         cx.notify();
         await doc.draw(cx);
       } catch (e) {
-        if (this.doc === doc && doc.text === null) {
+        if (this.doc === doc && doc.text === null && this.text === null) {
           this.error = `Cannot read this file: ${String(e?.message ?? e)}`;
         }
       } finally {
@@ -186,17 +252,9 @@ export class Viewer {
       }
       return;
     }
-    // A malformed web or mail address is not a file.
-    if (/^(?:https?|mailto):/i.test(url)) return;
-    const clean = url.split("#")[0];
-    if (!isMarkdown(clean) || !this.file) return;
-    let path = decodeURIComponent(
-      clean.startsWith("file://") ? clean.slice(7) : clean,
-    );
-    if (!path.startsWith("/")) {
-      path = `${this.file.replace(/\/[^/]*$/, "")}/${path}`;
-    }
-    this.open(path, this.on, cx);
+    const target = resolveLink(url, this.file);
+    if (!target || target.path === this.file) return;
+    this.open(target.path, this.on, cx, false, target.lines);
   }
 
   render() {
@@ -291,6 +349,8 @@ export class Viewer {
         .text_size(13)
         .text_color(t.blocked)
         .child(this.error);
+    } else if (this.editor) {
+      body = Editor.new(this.editor).flex_1().min_h(0);
     } else if (this.doc.text === null) {
       body = div()
         .flex_1()
