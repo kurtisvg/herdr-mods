@@ -1,14 +1,24 @@
 // Standalone markdown viewer for a split pane or dedicated tab.
 // Props: `{ role?: "viewer", file?: "/absolute/path.md", on?: "<machine>" }`.
-// Prompts for a path when `file` is omitted, and polls so external edits appear.
+// Prompts for a path when `file` is omitted, watches local folders for edits,
+// and polls remote files.
 
 import { div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { props, readTextFile, theme, spaces, checking } from "herdr";
-import { isMarkdown } from "./model.js";
+import {
+  props,
+  readTextFile,
+  theme,
+  spaces,
+  checking,
+  watchFolder,
+} from "herdr";
+import { isMarkdown, watchDir, watchBatchMatches } from "./model.js";
 import { MarkdownDoc } from "./doc.js";
 import { Pictures } from "./pictures.js";
 import { Diagrams } from "./diagrams.js";
+
+const POLL_MS = 3000;
 
 export class Viewer {
   init(_props, cx) {
@@ -17,6 +27,10 @@ export class Viewer {
     this.doc = new MarkdownDoc("mv", this.pictures, this.diagrams);
     this.history = [];
     this.size = null;
+    this.watched = null;
+    this.folderWatch = null;
+    this.pollTimer = null;
+    this.reloadQueued = false;
     this.input = InputState.new({ placeholder: "/path/to/file.md" });
     this.input.on("submit", (_e, cx) => {
       const path = this.input.value().trim();
@@ -35,47 +49,104 @@ export class Viewer {
     if (p.file) this.open(p.file, p.on ?? null, cx, true);
     else if (saved?.file) this.open(saved.file, saved.on ?? null, cx, true);
     else this.on = here;
-
-    cx.timer.every(3000, (cx) => this.poll(cx));
   }
 
-  show(file, on) {
+  close() {
+    this.stopWatch();
+  }
+
+  stopWatch() {
+    this.watched = null;
+    if (this.folderWatch) {
+      this.folderWatch.cancel();
+      this.folderWatch = null;
+    }
+    if (this.pollTimer) {
+      this.pollTimer.cancel();
+      this.pollTimer = null;
+    }
+  }
+
+  watch(cx) {
+    this.stopWatch();
+    if (!this.file) return;
+    if (this.on) {
+      this.pollTimer = cx.timer.every(POLL_MS, (cx) => this.load(cx));
+      return;
+    }
+
+    const dir = watchDir(this.file);
+    if (!dir) return;
+    const token = {};
+    this.watched = token;
+
+    cx.spawn(async (cx) => {
+      try {
+        while (this.watched === token) {
+          const task = watchFolder(dir);
+          this.folderWatch = task;
+          const paths = await task;
+          if (this.folderWatch === task) this.folderWatch = null;
+          if (!paths.length || this.watched !== token) break;
+          if (watchBatchMatches(paths, dir, [this.file, ...this.doc.paths()])) {
+            this.load(cx);
+          }
+        }
+      } catch {
+        // Watch failed (e.g. Linux directory limit); fall back to polling.
+        if (this.watched === token) {
+          this.pollTimer = cx.timer.every(POLL_MS, (cx) => this.load(cx));
+        }
+      } finally {
+        if (this.watched === token) {
+          this.watched = null;
+          this.folderWatch = null;
+        }
+      }
+    });
+  }
+
+  show(file, on, cx) {
     this.file = file;
     this.on = on ?? null;
     this.error = null;
-    this.polled = 0;
+    this.reloadQueued = false;
     this.doc = new MarkdownDoc("mv", this.pictures, this.diagrams, file, this.on);
+    this.watch(cx);
+    this.load(cx);
+    cx.notify();
   }
 
   open(file, on, cx, first) {
     if (!first && this.file) {
       this.history.push({ file: this.file, on: this.on });
     }
-    this.show(file, on);
     if (!props()?.file) {
       localStorage.setItem(
         "viewer.open",
-        JSON.stringify({ file, on: this.on }),
+        JSON.stringify({ file, on: on ?? null }),
       );
     }
-    this.load(cx);
-    cx.notify();
+    this.show(file, on, cx);
   }
 
   back(cx) {
     const last = this.history.pop();
     if (!last) return;
-    this.show(last.file, last.on);
-    this.load(cx);
-    cx.notify();
+    this.show(last.file, last.on, cx);
   }
 
   load(cx) {
     const file = this.file;
     const on = this.on;
     const doc = this.doc;
-    if (!file || this.loading) return;
+    if (!file) return;
+    if (this.loading) {
+      this.reloadQueued = true;
+      return;
+    }
     this.loading = true;
+    this.reloadQueued = false;
     cx.spawn(async (cx) => {
       try {
         const text = await readTextFile(file, { on });
@@ -98,16 +169,12 @@ export class Viewer {
       } finally {
         this.loading = false;
         cx.notify();
-        if (this.doc !== doc) this.load(cx);
+        if (this.doc !== doc || this.reloadQueued) {
+          this.reloadQueued = false;
+          this.load(cx);
+        }
       }
     });
-  }
-
-  poll(cx) {
-    if (!this.file) return;
-    this.polled = (this.polled ?? 0) + 1;
-    if (this.on && this.polled % 3 !== 0) return;
-    this.load(cx);
   }
 
   link(url, cx) {
