@@ -77,6 +77,7 @@ import {
   pictureFile,
   editorLanguage,
   tokenizeLine,
+  wrapSpans,
   formatMarkdown,
   machineOf,
 } from "./model.js";
@@ -88,6 +89,8 @@ const PAGE = 300; // rows per page in Comment and diff views
 const SPAN_BUDGET = 1100; // max colored token divs once cached
 const FIRST_BUDGET = 700; // max colored token divs while tokenizing
 const TOK_SLICE = 40; // uncached lines tokenized per frame
+const CODE_CHAR_WIDTH = 7; // logical px per monospace char at 11px text_size
+const CODE_GUTTER_WIDTH = 72; // line number + diff sign + right padding (px)
 const AUTOSAVE_MS = 800; // debounce after typing in Edit mode
 const CHANGED = 1000;
 const PER_FOLDER = 500;
@@ -2513,7 +2516,8 @@ export class Panel {
       number: t.ansi1,
       const: t.ansi6,
     };
-    let width = 300;
+    const codeWidth = Math.max(80, (this.size?.width ?? 360) - CODE_GUTTER_WIDTH);
+    const maxCols = Math.max(12, Math.floor(codeWidth / CODE_CHAR_WIDTH));
     let tokBudget = TOK_SLICE;
     let moreToColor = false;
     for (let i = this.start; i < end; i++) {
@@ -2522,15 +2526,11 @@ export class Panel {
       if (isLine(row) && !row.spans) {
         if (tokBudget > 0) {
           tokBudget -= 1;
-          row.spans = tokenizeLine(row.show, ext).map(([s, k]) => [
-            s.replace(/ /g, "\u00a0"),
-            k,
-          ]);
+          row.spans = tokenizeLine(row.show, ext);
         } else {
           moreToColor = true;
         }
       }
-      width = Math.max(width, (row.show.length + 1) * 7 + 70);
     }
     let budget = tokBudget < TOK_SLICE ? FIRST_BUDGET : SPAN_BUDGET;
     if (moreToColor && !this.coloring && cx) {
@@ -2552,7 +2552,6 @@ export class Panel {
       div()
         .id(id)
         .w_full()
-        .min_w(width)
         .h(26)
         .flex_none()
         .px(12)
@@ -2570,6 +2569,12 @@ export class Panel {
           cx.notify();
         })
         .child(label);
+    const spanEl = ([text, kind]) => {
+      const shown = text.replace(/ /g, "\u00a0");
+      return kind
+        ? div().flex_none().text_color(palette[kind]).child(shown)
+        : div().flex_none().child(shown);
+    };
 
     if (this.notice) {
       out.push(div().flex_none().px(12).py(8).text_color(t.dim).child(this.notice));
@@ -2594,11 +2599,10 @@ export class Panel {
         out.push(
           div()
             .w_full()
-            .min_w(width)
-            .h(20)
+            .min_h(20)
+            .line_height("20px")
             .flex_none()
             .px(12)
-            .truncate()
             .font_family(mono)
             .bg(t.raised)
             .text_color(t.dim)
@@ -2608,11 +2612,10 @@ export class Panel {
         out.push(
           div()
             .w_full()
-            .min_w(width)
-            .h(20)
+            .min_h(20)
+            .line_height("20px")
             .flex_none()
             .px(12)
-            .truncate()
             .font_family(mono)
             .text_color(t.dim)
             .child(row.show),
@@ -2620,18 +2623,24 @@ export class Panel {
       } else {
         const picked = i >= lo && i <= hi;
         const spans = row.spans;
-        const colored =
-          spans && (spans.length > 1 || spans[0][1]) && budget >= spans.length;
-        if (colored) budget -= spans.length;
+        const hasColor = Boolean(spans && (spans.length > 1 || spans[0][1]));
+        const wrapped =
+          hasColor && budget >= spans.length ? wrapSpans(spans, maxCols) : null;
+        const spanCount = wrapped
+          ? wrapped.reduce((n, line) => n + line.length, 0)
+          : 0;
+        const colored = Boolean(wrapped && budget >= spanCount);
+        if (colored) budget -= spanCount;
         const signColor =
           row.kind === "+" ? t.ansi2 : row.kind === "-" ? t.ansi1 : t.dim;
         const r = h_flex()
           .id(`line-${i}`)
           .w_full()
-          .min_w(width)
-          .h(20)
+          .min_h(20)
+          .line_height("20px")
           .flex_none()
-          .whitespace_nowrap()
+          .items_start()
+          .pr(12)
           .font_family(mono)
           .cursor_pointer()
           .when(picked, (e) => e.bg(t.selected))
@@ -2657,17 +2666,21 @@ export class Panel {
               .text_color(signColor)
               .child(row.kind === " " ? "" : row.kind),
           );
-        if (colored) {
-          for (let j = 0; j < spans.length; j++) {
-            const [s, k] = spans[j];
-            r.child(
-              k
-                ? div().flex_none().text_color(palette[k]).child(s)
-                : div().flex_none().child(s),
-            );
-          }
+        if (!colored) {
+          r.child(div().flex_1().min_w(0).child(row.show));
+        } else if (wrapped.length === 1) {
+          r.child(h_flex().flex_1().min_w(0).children(wrapped[0].map(spanEl)));
         } else {
-          r.child(div().flex_1().min_w(0).truncate().child(row.show));
+          r.child(
+            v_flex()
+              .flex_1()
+              .min_w(0)
+              .children(
+                wrapped.map((line) =>
+                  h_flex().w_full().children(line.map(spanEl)),
+                ),
+              ),
+          );
         }
         out.push(r);
         if (this.revealRow === i) {
@@ -3249,7 +3262,10 @@ export class Panel {
       )
       .when(Boolean(this.open) && !inEditor, (e) => {
         const drawnBoxW = Math.max(180, (this.size?.width ?? 360) - 34);
-        const codeBoxW = Math.max(180, (this.size?.width ?? 360) - 72);
+        const codeBoxW = Math.max(
+          180,
+          (this.size?.width ?? 360) - CODE_GUTTER_WIDTH,
+        );
         return e.child(
           div()
             .flex_1()
@@ -3261,7 +3277,7 @@ export class Panel {
                 .id("review-code")
                 .absolute()
                 .inset_0()
-                .overflow_scroll()
+                .overflow_y_scroll()
                 .track_scroll(this.scroll)
                 .children(
                   !this.ready
@@ -3272,7 +3288,7 @@ export class Panel {
                 ),
             )
             .when(this.ready, (e) =>
-              e.child(Scrollbar.new("review-code").absolute().inset_0()),
+              e.child(Scrollbar.vertical("review-code").absolute().inset_0()),
             ),
         );
       })

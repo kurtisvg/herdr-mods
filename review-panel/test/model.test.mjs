@@ -37,6 +37,7 @@ import {
   splitMarkdown,
   editorLanguage,
   tokenizeLine,
+  wrapSpans,
   wrapMarkdown,
   formatMarkdown,
   machineOf,
@@ -1388,5 +1389,89 @@ test("editorLanguage maps extensions, special filenames, and edge-case paths", (
 
   for (const [name, path, expected] of cases) {
     assert.equal(editorLanguage(path), expected, name);
+  }
+});
+
+test("wrapSpans leaves short lines intact and wraps long colored spans at spaces", () => {
+  const short = tokenizeLine("const x = 1;", "js");
+  assert.deepEqual(wrapSpans(short, 40), [short]);
+  assert.deepEqual(wrapSpans([], 40), [[]]);
+  assert.deepEqual(wrapSpans(short, 0), [short]);
+
+  const line = 'const message = "hello world from herdr";';
+  const spans = tokenizeLine(line, "js");
+  const wrapped = wrapSpans(spans, 22);
+  assert.deepEqual(
+    wrapped.map((row) => row.map(([text]) => text).join("")),
+    ['const message = ', '"hello world from ', 'herdr";'],
+  );
+  assert.equal(
+    wrapped.flat().map(([text]) => text).join(""),
+    line,
+  );
+  // Color kind stays attached to every piece of a split string literal.
+  assert.deepEqual(wrapped[1], [['"hello world from ', "string"]]);
+  assert.deepEqual(wrapped[2], [
+    ['herdr"', "string"],
+    [";", null],
+  ]);
+});
+
+test("wrapSpans handles hard breaks, indentation, surrogates, and empty spans", () => {
+  const cases = [
+    {
+      name: "indented unbroken token",
+      spans: [["        https://example.com/very/long/path", "comment"]],
+      maxCols: 20,
+      expected: [
+        [["        https://exam", "comment"]],
+        [["ple.com/very/long/pa", "comment"]],
+        [["th", "comment"]],
+      ],
+    },
+    {
+      name: "mid-line surrogate pair",
+      spans: [["abcd😀ef", "string"]],
+      maxCols: 5,
+      expected: [
+        [["abcd", "string"]],
+        [["😀ef", "string"]],
+      ],
+    },
+    {
+      name: "single-column surrogate pair",
+      spans: [["😀a", "string"]],
+      maxCols: 1,
+      expected: [
+        [["😀", "string"]],
+        [["a", "string"]],
+      ],
+    },
+    {
+      name: "all-spaces line",
+      spans: [[" ".repeat(10), null]],
+      maxCols: 4,
+      expected: [
+        [["    ", null]],
+        [["    ", null]],
+        [["  ", null]],
+      ],
+    },
+    {
+      name: "empty span skipped during wrap",
+      spans: [
+        ["", null],
+        ["hello world", "string"],
+      ],
+      maxCols: 6,
+      expected: [
+        [["hello ", "string"]],
+        [["world", "string"]],
+      ],
+    },
+  ];
+
+  for (const { name, spans, maxCols, expected } of cases) {
+    assert.deepEqual(wrapSpans(spans, maxCols), expected, name);
   }
 });
