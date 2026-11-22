@@ -31,6 +31,7 @@ import {
   isMarkdown,
   parseFrontmatter,
   markdownBlocks,
+  wrapParagraphBlock,
   bareFences,
   blockFor,
   nextHoveredBlock,
@@ -690,6 +691,7 @@ test("markdownBlocks splits a file into the blocks a reader sees, with their lin
     ],
   );
   assert.equal(blocks[1].text, "A paragraph that\nruns over two lines.");
+  assert.equal(blocks[1].para, true);
   assert.equal(blocks[4].text, "- second item\n\n  still the second item");
   assert.deepEqual(blocks[7].cells, ["a", "b"]);
   assert.equal(blocks[7].header, true);
@@ -703,7 +705,10 @@ test("markdownBlocks splits a file into the blocks a reader sees, with their lin
       ["js", 1, "# not a heading"],
     ],
   );
+  assert.equal(blocks[12].para, true);
   assert.equal(blocks[13].code, "graph TD\n  A --> B");
+  assert.equal(blocks[14].text, "Setext\n------");
+  assert.equal(blocks[14].para, undefined);
   for (let i = 1; i < blocks.length; i++) {
     assert.ok(blocks[i].from > blocks[i - 1].to);
   }
@@ -718,6 +723,69 @@ test("markdownBlocks keeps an unclosed fence to the end, and handles an empty fi
   assert.equal(open[1].code, "graph TD\n  A --> B");
   assert.deepEqual(markdownBlocks(""), []);
   assert.deepEqual(markdownBlocks("\n\n"), []);
+});
+
+test("wrapParagraphBlock reflows paragraphs to pixel width, maps source lines, and balances inline formatting", () => {
+  const [para] = markdownBlocks(
+    "This has **bold text that\nwraps onto** the next line with [a link](https://example.com/very/long/url) and more words.",
+  );
+  // Wide pane: joins the two source lines into a single visual line.
+  const wide = wrapParagraphBlock(para, 900, 1);
+  assert.equal(wide.length, 1);
+  assert.equal(wide[0], para);
+
+  // Narrow pane: reflows into multiple visual lines with balanced `**` and source line ranges.
+  const narrow = wrapParagraphBlock(para, 220, 7);
+  assert.ok(narrow.length >= 3);
+  assert.ok(narrow.every((b) => b.paraGroup === 7));
+  assert.equal(narrow[0].from, 1);
+  assert.equal(narrow[narrow.length - 1].to, 2);
+  // Bold is balanced on every line where it appears.
+  for (const b of narrow) {
+    const count = (b.text.match(/\*\*/g) ?? []).length;
+    assert.equal(count % 2, 0, `unbalanced bold in: ${b.text}`);
+  }
+  // Link stays intact as one atomic token.
+  assert.ok(narrow.some((b) => b.text.includes("[a link](https://example.com/very/long/url)")));
+
+  // Explicit hard line breaks (`  \n`) always split even on a wide pane.
+  const [hard] = markdownBlocks("Line one  \nLine two");
+  const splitHard = wrapParagraphBlock(hard, 900, 2);
+  assert.deepEqual(
+    splitHard.map((b) => [b.from, b.to, b.text]),
+    [
+      [1, 1, "Line one"],
+      [2, 2, "Line two"],
+    ],
+  );
+
+  // Simple list items wrap with hanging marker/indent; nested items stay whole.
+  const listBlocks = markdownBlocks(
+    "- A very long bullet sentence with **bold words that wrap** across visual lines.\n" +
+      "1. A numbered item that also wraps across multiple visual lines here.\n" +
+      "- [x] A completed task item that wraps across multiple visual lines.\n" +
+      "- Parent item\n  - Nested child item\n",
+  );
+  assert.equal(listBlocks[0].listItem, true);
+  assert.equal(listBlocks[1].listItem, true);
+  assert.equal(listBlocks[2].listItem, true);
+  assert.equal(listBlocks[3].listItem, undefined);
+
+  const wrappedBullet = wrapParagraphBlock(listBlocks[0], 220, 10);
+  assert.ok(wrappedBullet.length >= 2);
+  assert.equal(wrappedBullet[0].listMarker, "•");
+  assert.equal(wrappedBullet[1].listMarker, "");
+  assert.equal(wrappedBullet[0].listIndent, wrappedBullet[1].listIndent);
+  assert.ok(wrappedBullet[0].listIndent >= 18);
+
+  const wrappedNum = wrapParagraphBlock(listBlocks[1], 220, 11);
+  assert.ok(wrappedNum.length >= 2);
+  assert.equal(wrappedNum[0].listMarker, "1.");
+  assert.equal(wrappedNum[1].listMarker, "");
+
+  const wrappedTask = wrapParagraphBlock(listBlocks[2], 220, 12);
+  assert.ok(wrappedTask.length >= 2);
+  assert.equal(wrappedTask[0].listMarker, "☑");
 });
 
 test("markdownBlocks splits fenced code blocks per line, including empty and unclosed fences", () => {
@@ -831,6 +899,7 @@ test("markdownBlocks splits multi-paragraph and multi-part quotes with exact lin
   );
   assert.equal(blocks[0].text, "## Quoted Heading");
   assert.equal(blocks[1].text, "First paragraph\ncontinues here.");
+  assert.equal(blocks[1].para, true);
   assert.equal(blocks[4].text, "- second item\n\n  still second");
   assert.deepEqual(
     blocks.slice(5, 8).map((b) => [b.lang, b.codeGroup, b.text]),

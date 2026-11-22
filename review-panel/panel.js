@@ -72,6 +72,7 @@ import {
   attach,
   isMarkdown,
   markdownBlocks,
+  wrapParagraphBlock,
   bareFences,
   blockFor,
   nextHoveredBlock,
@@ -1720,8 +1721,10 @@ export class Panel {
   }
 
   spanBlocks(i) {
-    const a = this.blocks[this.anchorBlock];
-    const b = this.blocks[i];
+    const list = this.viewBlocks ?? this.blocks;
+    const a = list?.[this.anchorBlock];
+    const b = list?.[i];
+    if (!a || !b) return;
     this.headBlock = i;
     this.anchor = Math.min(a.from, b.from) - 1;
     this.head = Math.max(a.to, b.to) - 1;
@@ -2426,7 +2429,9 @@ export class Panel {
   }
 
   drawn(t, comments, mono, boxWidth) {
-    const blocks = this.blocks;
+    const QUOTE_BORDER = 3;
+    const QUOTE_PAD = 12;
+    const rawBlocks = this.blocks;
     const out = [];
     const under = new Map();
     const lo =
@@ -2437,6 +2442,36 @@ export class Panel {
       120,
       (this.size?.width ?? 360) - MD_HORIZONTAL_CHROME,
     );
+    const end = this.start + PAGE;
+    if (
+      this.viewBlocksSource !== rawBlocks ||
+      this.viewBlocksRoom !== room ||
+      this.viewBlocksStart !== this.start
+    ) {
+      let paraGroups = 0;
+      const expanded = [];
+      for (const b of rawBlocks) {
+        const onPage = b.from - 1 >= this.start && b.from - 1 < end;
+        if (onPage && (b.para || b.listItem)) {
+          const blockRoom = Math.max(
+            120,
+            room - (b.quote ?? 0) * (QUOTE_BORDER + QUOTE_PAD),
+          );
+          expanded.push(...wrapParagraphBlock(b, blockRoom, ++paraGroups));
+        } else {
+          expanded.push(b);
+        }
+      }
+      this.viewBlocksSource = rawBlocks;
+      this.viewBlocksRoom = room;
+      this.viewBlocksStart = this.start;
+      this.viewBlocks = expanded;
+    }
+    const blocks = this.viewBlocks;
+    if (this.revealLine != null) {
+      this.revealBlock = blockFor(blocks, this.revealLine);
+      this.revealLine = null;
+    }
     const palette = {
       comment: t.dim,
       string: t.ansi2,
@@ -2497,7 +2532,6 @@ export class Panel {
       if (at < 0) push(c, "not on a line shown here");
       else under.set(at, [...(under.get(at) ?? []), c]);
     }
-    const end = this.start + PAGE;
     if (this.start > 0) {
       out.push(
         pager(
@@ -2509,8 +2543,6 @@ export class Panel {
     }
     let diagramSlot = 0;
     const fileName = this.open?.path?.split("/").pop();
-    const QUOTE_BORDER = 3;
-    const QUOTE_PAD = 12;
     blocks.forEach((b, i) => {
       const slot = b.kind === "mermaid" ? diagramSlot++ : -1;
       if (b.from - 1 < this.start || b.from - 1 >= end) return;
@@ -2545,7 +2577,10 @@ export class Panel {
         return { quoted, joinedPrev, joinedNext };
       };
 
-      const pushBlockRow = (content, { mt = 0, mb = 0, py = 0, highlightRow = false } = {}) => {
+      const pushBlockRow = (
+        content,
+        { mt = 0, mb = 0, pt = 0, pb = 0, highlightRow = false } = {},
+      ) => {
         const showGutter = this.hoveredBlock === i || picked;
         const gutter = h_flex()
           .id(`block-add-${i}`)
@@ -2574,7 +2609,8 @@ export class Panel {
             .gap(6)
             .mt(mt)
             .mb(mb)
-            .py(py)
+            .pt(pt)
+            .pb(pb)
             .pl(6)
             .pr(16)
             .when(highlightRow && picked, (e) => e.bg(t.selected))
@@ -2771,12 +2807,31 @@ export class Panel {
       }
       if (b.pictures) body.push(renderPictures());
 
-      const bodyEl = v_flex().w_full().gap(4).children(body);
+      const bodyInner = v_flex().w_full().gap(4).children(body);
+      const bodyEl = b.listIndent
+        ? h_flex()
+            .w_full()
+            .items_start()
+            .child(
+              div()
+                .w(b.listIndent)
+                .flex_none()
+                .text_color(t.muted)
+                .child(b.listMarker || " "),
+            )
+            .child(bodyInner.flex_1().min_w(0))
+        : bodyInner;
+      const joinedParaPrev =
+        Boolean(b.paraGroup) && prevVisible && prev.paraGroup === b.paraGroup;
+      const joinedParaNext =
+        Boolean(b.paraGroup) && nextVisible && next.paraGroup === b.paraGroup;
+      const padTop = joinedParaPrev ? 1 : 3;
+      const padBottom = joinedParaNext ? 1 : 3;
       if (quoteDepth > 0) {
         const { quoted, joinedPrev: qPrev, joinedNext: qNext } = wrapQuote(
           bodyEl,
-          3,
-          3,
+          padTop,
+          padBottom,
         );
         pushBlockRow(quoted, {
           mt: qPrev ? 0 : 3,
@@ -2784,7 +2839,7 @@ export class Panel {
           highlightRow: true,
         });
       } else {
-        pushBlockRow(bodyEl, { py: 3, highlightRow: true });
+        pushBlockRow(bodyEl, { pt: padTop, pb: padBottom, highlightRow: true });
       }
     });
     if (blocks.some((b) => b.from - 1 >= end)) {
@@ -3087,7 +3142,7 @@ export class Panel {
           const at = blockFor(this.blocks, from);
           if (at >= 0) {
             this.start = Math.floor((this.blocks[at].from - 1) / PAGE) * PAGE;
-            this.revealBlock = at;
+            this.revealLine = from;
           }
         } else if (this.rows.length) {
           const row = Math.max(0, Math.min(from - 1, this.rows.length - 1));

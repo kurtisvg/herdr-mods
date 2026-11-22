@@ -985,6 +985,299 @@ function tableBlocks(cur, tableGroup, quoteMeta) {
   return blocks;
 }
 
+const WORD_CHAR_RE = /[A-Za-z0-9]/;
+const NARROW_CHAR_RE = /[ilItfjr1.,:;!|'()[\]{}]/;
+const WIDE_CHAR_RE = /[mwMW@%&]/;
+const UPPER_DIGIT_RE = /[A-Z0-9]/;
+
+// Estimates the rendered pixel width of a Markdown inline token at `fontSize`,
+// ignoring hidden link destinations and formatting markers.
+function measureInlineWidth(token, fontSize = 13) {
+  let width = 0;
+  let i = 0;
+  while (i < token.length) {
+    if (token[i] === "\\" && i + 1 < token.length) {
+      i += 1;
+    } else if (token[i] === "`") {
+      const end = scanCodeSpan(token, i);
+      if (end > 0) {
+        let ticks = 0;
+        while (token[i + ticks] === "`") ticks += 1;
+        const inner = token.slice(i + ticks, end - ticks);
+        width += inner.length * fontSize * 0.6;
+        i = end;
+        continue;
+      }
+    } else if (token[i] === "[") {
+      const closeBracket = token.indexOf("]", i + 1);
+      if (closeBracket > i && token[closeBracket + 1] === "(") {
+        const closeParen = token.indexOf(")", closeBracket + 2);
+        if (closeParen > closeBracket + 1) {
+          width += measureInlineWidth(token.slice(i + 1, closeBracket), fontSize);
+          i = closeParen + 1;
+          continue;
+        }
+      }
+    } else if (
+      token.startsWith("**", i) ||
+      token.startsWith("__", i) ||
+      token.startsWith("~~", i)
+    ) {
+      i += 2;
+      continue;
+    } else if (token[i] === "*" || token[i] === "_") {
+      const prev = i > 0 ? token[i - 1] : "";
+      const next = i + 1 < token.length ? token[i + 1] : "";
+      if (!(token[i] === "_" && WORD_CHAR_RE.test(prev) && WORD_CHAR_RE.test(next))) {
+        i += 1;
+        continue;
+      }
+    }
+    const ch = token[i];
+    if (ch === " ") width += fontSize * 0.28;
+    else if (NARROW_CHAR_RE.test(ch)) width += fontSize * 0.34;
+    else if (WIDE_CHAR_RE.test(ch)) width += fontSize * 0.78;
+    else if (UPPER_DIGIT_RE.test(ch)) width += fontSize * 0.62;
+    else width += fontSize * 0.53;
+    i += 1;
+  }
+  return width;
+}
+
+// Scans one line into atomic inline tokens so links and code spans stay intact.
+function tokenizeParagraphLine(line, lineNum, fontSize) {
+  const tokens = [];
+  let i = 0;
+  while (i < line.length) {
+    while (i < line.length && (line[i] === " " || line[i] === "\t")) i += 1;
+    if (i >= line.length) break;
+    const start = i;
+    while (i < line.length && line[i] !== " " && line[i] !== "\t") {
+      if (line[i] === "\\" && i + 1 < line.length) {
+        i += 2;
+        continue;
+      }
+      if (line[i] === "`") {
+        const end = scanCodeSpan(line, i);
+        if (end > 0) {
+          i = end;
+          continue;
+        }
+      }
+      if (line[i] === "[") {
+        const closeBracket = line.indexOf("]", i + 1);
+        if (closeBracket > i && line[closeBracket + 1] === "(") {
+          const closeParen = line.indexOf(")", closeBracket + 2);
+          if (closeParen > closeBracket + 1) {
+            i = closeParen + 1;
+            continue;
+          }
+        }
+      }
+      i += 1;
+    }
+    const text = line.slice(start, i);
+    tokens.push({ text, line: lineNum, width: measureInlineWidth(text, fontSize) });
+  }
+  return tokens;
+}
+
+// Balances inline Markdown formatting spans (`**`, `__`, `~~`, `*`, `_`, and
+// backtick code spans) across lines when a paragraph is split into visual
+// lines so each line renders cleanly on its own.
+function splitParagraphLines(lines) {
+  if (!lines.some((l) => /[*_~`]/.test(l))) return lines;
+  const stack = [];
+  const out = [];
+
+  for (const line of lines) {
+    const leadMatch = /^[ \t]*/.exec(line);
+    const lead = leadMatch[0];
+    const body = line.slice(lead.length).trimEnd();
+    const prefix = stack.join("");
+
+    let i = 0;
+    while (i < line.length) {
+      const ch = line[i];
+      const top = stack[stack.length - 1];
+      if (top && top[0] === "`") {
+        if (ch === "`") {
+          let j = i;
+          while (j < line.length && line[j] === "`") j += 1;
+          if (j - i === top.length) stack.pop();
+          i = j;
+          continue;
+        }
+        i += 1;
+        continue;
+      }
+      if (ch === "\\" && i + 1 < line.length) {
+        i += 2;
+        continue;
+      }
+      if (ch === "`") {
+        let j = i;
+        while (j < line.length && line[j] === "`") j += 1;
+        stack.push(line.slice(i, j));
+        i = j;
+        continue;
+      }
+      if (ch !== "*" && ch !== "_" && ch !== "~") {
+        i += 1;
+        continue;
+      }
+      let mark = null;
+      if (line[i + 1] === ch) {
+        mark = ch + ch;
+      } else if (ch === "*" || ch === "_") {
+        mark = ch;
+      }
+      if (!mark) {
+        i += 1;
+        continue;
+      }
+      const prev = i > 0 ? line[i - 1] : "";
+      const next = i + mark.length < line.length ? line[i + mark.length] : "";
+      const intraword =
+        ch === "_" && WORD_CHAR_RE.test(prev) && WORD_CHAR_RE.test(next);
+      if (!intraword) {
+        const idx = stack.lastIndexOf(mark);
+        const canClose = idx >= 0 && prev && !/\s/.test(prev);
+        const canOpen = next && !/\s/.test(next);
+        if (canClose) {
+          stack.splice(idx, 1);
+        } else if (canOpen) {
+          stack.push(mark);
+        }
+      }
+      i += mark.length;
+    }
+
+    const suffix = [...stack].reverse().join("");
+    out.push(body ? `${lead}${prefix}${body}${suffix}` : line);
+  }
+  return out;
+}
+
+const LIST_MARKER_RE = /^ {0,3}([-*+]|\d{1,9}[.)])\s+(?:\[([ xX])\]\s+)?/;
+
+function isSimpleListItem(lines) {
+  for (let k = 1; k < lines.length; k++) {
+    const trimmed = lines[k].trim();
+    if (
+      !trimmed ||
+      LIST_ITEM_RE.test(trimmed) ||
+      FENCE_OPEN_RE.test(trimmed) ||
+      QUOTE_RE.test(trimmed) ||
+      HEADING_RE.test(trimmed) ||
+      RULE_RE.test(trimmed) ||
+      TABLE_RE.test(trimmed)
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Re-wraps a paragraph or simple list-item block to `maxWidthPx` (logical px
+// at `fontSize`) into per-visual-line commentable blocks, preserving each
+// visual line's source line range (`from`/`to`) and balancing inline
+// formatting across splits.
+export function wrapParagraphBlock(block, maxWidthPx, paraGroup, fontSize = 13) {
+  const raw = block.shown ?? block.text;
+  if ((!block.para && !block.listItem) || !raw.trim() || !maxWidthPx || maxWidthPx <= 0) {
+    return [block];
+  }
+  const srcLines = raw.split("\n");
+  let listMarker = null;
+  let listIndent = 0;
+  if (block.listItem) {
+    const match = LIST_MARKER_RE.exec(srcLines[0]);
+    if (!match) return [block];
+    listMarker =
+      match[2] === "x" || match[2] === "X"
+        ? "☑"
+        : match[2] === " "
+          ? "☐"
+          : /^\d/.test(match[1])
+            ? match[1]
+            : "•";
+    listIndent = Math.max(18, Math.ceil(measureInlineWidth(listMarker, fontSize) + 8));
+    srcLines[0] = srcLines[0].slice(match[0].length);
+    for (let idx = 1; idx < srcLines.length; idx++) {
+      srcLines[idx] = srcLines[idx].trimStart();
+    }
+  }
+  const effectiveWidth = maxWidthPx - listIndent;
+  if (effectiveWidth <= 0) return [block];
+
+  const segments = [];
+  let curTokens = [];
+  for (let idx = 0; idx < srcLines.length; idx++) {
+    const line = srcLines[idx];
+    const hardBreak = /(?: {2,}|\\)$/.test(line);
+    const cleaned = hardBreak ? line.replace(/(?: {2,}|\\)$/, "") : line;
+    curTokens.push(...tokenizeParagraphLine(cleaned, block.from + idx, fontSize));
+    if (hardBreak) {
+      if (curTokens.length) segments.push(curTokens);
+      curTokens = [];
+    }
+  }
+  if (curTokens.length) segments.push(curTokens);
+
+  const limit = effectiveWidth * 0.93;
+  const spaceW = fontSize * 0.28;
+  const wrapped = [];
+
+  for (const tokens of segments) {
+    let lineTokens = [];
+    let lineWidth = 0;
+    const flush = () => {
+      if (!lineTokens.length) return;
+      wrapped.push({
+        from: lineTokens[0].line,
+        to: lineTokens[lineTokens.length - 1].line,
+        text: lineTokens.map((tok) => tok.text).join(" "),
+      });
+      lineTokens = [];
+      lineWidth = 0;
+    };
+    for (const tok of tokens) {
+      const nextWidth = lineTokens.length ? lineWidth + spaceW + tok.width : tok.width;
+      if (lineTokens.length && nextWidth > limit) flush();
+      lineTokens.push(tok);
+      lineWidth = lineTokens.length === 1 ? tok.width : lineWidth + spaceW + tok.width;
+    }
+    flush();
+  }
+
+  if (wrapped.length <= 1) return [block];
+  const balanced = splitParagraphLines(wrapped.map((w) => w.text));
+  return wrapped.map((w, k) => {
+    const item = {
+      kind: "md",
+      from: w.from,
+      to: w.to,
+      text: balanced[k],
+      paraGroup,
+    };
+    if (block.para) item.para = true;
+    if (block.listItem) {
+      item.listItem = true;
+      item.listMarker = k === 0 ? listMarker : "";
+      item.listIndent = listIndent;
+    }
+    if (block.quote) {
+      item.quote = block.quote;
+      item.quoteGroup = block.quoteGroup;
+    }
+    if (block.pictures && k === wrapped.length - 1) {
+      item.pictures = block.pictures;
+    }
+    return item;
+  });
+}
+
 // Splits a markdown file into clickable visual blocks with 1-based inclusive
 // line numbers:
 //   - `frontmatter` leading YAML frontmatter carrying parsed `entries`
@@ -1060,6 +1353,10 @@ export function markdownBlocks(text, where) {
         from: cur.from,
         to: cur.from + cur.lines.length - 1,
         text: cur.lines.join("\n"),
+        ...(cur.type === "para" && !cur.setext ? { para: true } : {}),
+        ...(cur.type === "item" && isSimpleListItem(cur.lines)
+          ? { listItem: true }
+          : {}),
         ...quoteMeta,
       };
       if (cur.mermaid) {
@@ -1113,6 +1410,7 @@ export function markdownBlocks(text, where) {
       }
       if (cur?.type === "para" && SETEXT_RE.test(line)) {
         cur.lines.push(line);
+        cur.setext = true;
         close();
         continue;
       }
