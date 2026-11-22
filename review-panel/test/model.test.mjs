@@ -32,6 +32,8 @@ import {
   markdownBlocks,
   bareFences,
   blockFor,
+  nextHoveredBlock,
+  shouldCopyQuote,
   textKey,
   pictureFile,
   watchDir,
@@ -1625,4 +1627,31 @@ test("lineRangeOffsets maps 1-based line ranges to UTF-16 offsets", () => {
   assert.deepEqual(lineRangeOffsets("a\n\nb\n", 2, 2), { start: 2, end: 2 });
   assert.deepEqual(lineRangeOffsets("solo", 1, 1), { start: 0, end: 4 });
   assert.deepEqual(lineRangeOffsets("", 1, 1), { start: 0, end: 0 });
+});
+
+test("nextHoveredBlock tracks hover without stale leaves clearing a newer block", () => {
+  assert.equal(nextHoveredBlock(null, 2, true), 2);
+  assert.equal(nextHoveredBlock(2, 3, true), 3);
+  assert.equal(nextHoveredBlock(3, 2, false), 3);
+  assert.equal(nextHoveredBlock(3, 3, false), null);
+  assert.equal(nextHoveredBlock(null, 0, false), null);
+});
+
+test("shouldCopyQuote yields to editor, rendered markdown TextView, and non-empty drafts", () => {
+  const base = {
+    mod: true,
+    key: "c",
+    inEditor: false,
+    inMarkdownPreview: false,
+    hasQuote: true,
+    hasDraftText: false,
+  };
+
+  assert.equal(shouldCopyQuote(base), true);
+  assert.equal(shouldCopyQuote({ ...base, inMarkdownPreview: true }), false);
+  assert.equal(shouldCopyQuote({ ...base, inEditor: true }), false);
+  assert.equal(shouldCopyQuote({ ...base, hasDraftText: true }), false);
+  assert.equal(shouldCopyQuote({ ...base, hasQuote: false }), false);
+  assert.equal(shouldCopyQuote({ ...base, mod: false }), false);
+  assert.equal(shouldCopyQuote({ ...base, key: "v" }), false);
 });
