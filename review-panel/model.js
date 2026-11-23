@@ -1655,6 +1655,10 @@ function createFenceScanner() {
 // gets extra top padding. Stripping opening fence languages keeps padding even
 // while leaving inner example fences and 4-space indented code blocks intact.
 export function bareFences(text) {
+  // An opening fence needs three backticks or tildes. Most blocks have neither,
+  // and the preview calls this for every block while it renders.
+  if (!text.includes("```") && !text.includes("~~~")) return text;
+
   const step = createFenceScanner();
   return text
     .split("\n")

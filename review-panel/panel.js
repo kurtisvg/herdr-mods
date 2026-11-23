@@ -333,6 +333,7 @@ export class Panel {
     this.raw = localStorage.getItem("raw") === "1";
     this.mdMode = "rendered"; // "rendered" | "edit" | "comment" in Files
     this.blocks = null;
+    this.shownTexts = new WeakMap(); // block -> { text, key }, see shownText
     this.frontmatterOpen = true;
     this.anchorBlock = null;
     this.headBlock = null;
@@ -1634,17 +1635,18 @@ export class Panel {
   setRows(rows, notice, blocks = null) {
     this.notice = notice;
     this.ready = true;
-    this.blocks = blocks;
     const old = this.rows;
-    if (
+    const same =
       rows.length === old.length &&
       rows.every(
         (r, i) =>
           r.kind === old[i].kind && r.n === old[i].n && r.text === old[i].text,
-      )
-    ) {
-      return;
-    }
+      );
+    // A refresh reads the file again every few seconds. The preview keeps the
+    // wrapped lines and the shown text that it prepared for the current blocks.
+    // Blocks built from the same rows are equal, so the current blocks stay.
+    this.blocks = same && blocks && this.blocks ? this.blocks : blocks;
+    if (same) return;
     this.rows = rows;
     this.anchor = null;
     this.head = null;
@@ -2428,6 +2430,19 @@ export class Panel {
     });
   }
 
+  // The markdown text that a block shows, with the key of its text view. Every
+  // render draws all blocks on the page, and hovering a block renders again.
+  // A block does not change after it is built, so its text is prepared once.
+  shownText(block) {
+    let shown = this.shownTexts.get(block);
+    if (!shown) {
+      const text = bareFences(block.shown ?? block.text);
+      shown = { text, key: textKey(text) };
+      this.shownTexts.set(block, shown);
+    }
+    return shown;
+  }
+
   drawn(t, comments, mono, boxWidth) {
     const QUOTE_BORDER = 3;
     const QUOTE_PAD = 12;
@@ -2759,11 +2774,8 @@ export class Panel {
 
       const rawShown = b.shown ?? b.text;
       const text = () => {
-        const shownText = bareFences(rawShown);
-        return TextView.markdown(
-          `review-md-${i}-${textKey(shownText)}`,
-          shownText,
-        )
+        const shown = this.shownText(b);
+        return TextView.markdown(`review-md-${i}-${shown.key}`, shown.text)
           .selectable(true)
           .on_link_click(link);
       };
