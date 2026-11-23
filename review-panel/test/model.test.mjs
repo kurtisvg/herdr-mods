@@ -1056,6 +1056,18 @@ test("bareFences strips opening fence languages, including in lists and quotes, 
   assert.notEqual(textKey("hello"), textKey("world"));
 });
 
+test("bareFences returns text that has no fence marker unchanged", () => {
+  const plain = [
+    "# Title\r",
+    "- item with `code` and ``two`` backticks",
+    "> quote with ~~struck~~ text",
+    "",
+    "    indented code",
+  ].join("\n");
+  assert.equal(bareFences(plain), plain);
+  assert.equal(bareFences(""), "");
+});
+
 test("isMarkdown goes by the file name", () => {
   assert.equal(isMarkdown("docs/README.md"), true);
   assert.equal(isMarkdown("a.MDX"), true);
